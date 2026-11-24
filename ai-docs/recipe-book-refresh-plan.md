@@ -26,6 +26,12 @@ Use the existing chicken soup as one of ten when suitable; add nine varied, usab
 
 **Done:** ten different recipes and ten working covers on the preview; quantities and steps make culinary sense; sample photos at card/detail sizes and validate all ten for scaling, image loads and one-page PDFs. Repeat seeding does not duplicate records or overwrite modified recipes. No keys or live database files are committed.
 
+## 4b. Simplify the cookbook design with the full collection
+
+Keep the design preview's typography, readable spacing, and regular photo grid. Remove the invented brand, promotional headings, repeated card kickers, taglines, and decorative footer copy. Use straightforward labels such as “Recipes” and “Ingredients.” Let the food photography provide the visual character. Put the recipe name near the top on mobile; serve controls and PDF shouldn't compete with the content.
+
+**Done:** compare two refinement passes with all ten recipes and covers in an isolated preview. Inspect the populated grid, filtered and empty states, ingredients, and recipe detail at desktop and mobile widths. Pick the calmer layout that gets readers to the recipes sooner. Preserve keyboard focus, labels, URLs, and the shared theme stylesheet. Get Terra approval and commit before live deployment.
+
 ## 5. Deploy the approved build to the existing preview
 
 Smoke test a separate instance or isolated data first. Replace only the preview process, preserving its bind, port, credentials, database and content. Record the checks and rollback procedure without secrets.

@@ -1085,7 +1085,7 @@ async fn public_font() -> impl IntoResponse {
 
 fn public_page(title: &str, content: &str) -> Response {
     html(format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light\"><title>{} · Hearth &amp; Table</title><link rel=\"stylesheet\" href=\"/assets/site.css\"></head><body><a class=\"skip-link\" href=\"#main\">Skip to content</a><header class=\"site-header\"><a class=\"wordmark\" href=\"/recipes\" aria-label=\"Hearth and Table home\">Hearth <span>&amp;</span> Table</a><nav class=\"site-nav\" aria-label=\"Main navigation\"><a href=\"/recipes\">Recipes</a><a href=\"/ingredients\">Ingredients</a></nav></header><main id=\"main\">{}</main><footer class=\"site-footer\"><span>Made for the kitchen table.</span><a href=\"/recipes\">Browse the recipe book</a></footer></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light\"><title>{}</title><link rel=\"stylesheet\" href=\"/assets/site.css\"></head><body><a class=\"skip-link\" href=\"#main\">Skip to content</a><header class=\"site-header\"><nav class=\"site-nav\" aria-label=\"Main navigation\"><a href=\"/recipes\">Recipes</a><a href=\"/ingredients\">Ingredients</a></nav></header><main id=\"main\">{}</main></body></html>",
         escape_html(title), content
     ))
 }
@@ -1095,7 +1095,7 @@ async fn public_index(
     Query(query): Query<PublicFilter>,
 ) -> Result<impl IntoResponse, ApiError> {
     let rows = public_rows(&state).await?;
-    let filter = query.q.as_deref().unwrap_or("").to_lowercase();
+    let filter = query.q.as_deref().unwrap_or("").trim().to_lowercase();
     let tag = query
         .tag
         .as_deref()
@@ -1116,21 +1116,24 @@ async fn public_index(
         .map(|row| public_card(&row))
         .collect::<String>();
     let empty = if cards.is_empty() {
-        "<p class=\"empty-notice\">No recipes match these filters. <a href=\"/recipes\">Clear filters</a></p>"
+        "<p class=\"empty-notice\">No recipes match these filters.</p>"
     } else {
         ""
     };
-    let heading = if tag.is_some() {
-        "Recipes to savor"
+    let clear = if query
+        .q
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || query
+            .tag
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        "<a class=\"text-link\" href=\"/recipes\">Clear filters</a>"
     } else {
-        "A well-loved collection"
+        ""
     };
-    let intro = if tag.is_some() {
-        "A little collection, gathered by tag."
-    } else {
-        "Good things to cook, share, and come back to."
-    };
-    let content = format!("<section class=\"intro\"><p class=\"eyebrow\">From our kitchen</p><h1>{heading}</h1><p class=\"lede\">{intro}</p></section><section class=\"browse-panel\" aria-labelledby=\"browse-heading\"><h2 id=\"browse-heading\">Find something good</h2><form class=\"search-form\" action=\"/recipes\" method=\"get\"><label>Recipe title <input type=\"search\" name=\"q\" value=\"{}\" placeholder=\"Try soup\"></label><label>Tag <input name=\"tag\" value=\"{}\" placeholder=\"Try weeknight\"></label><button class=\"button\" type=\"submit\">Find recipes</button><a class=\"text-link\" href=\"/recipes\">Clear filters</a></form></section>{}<section class=\"recipe-grid\" aria-label=\"Recipes\">{}</section>", escape_html(query.q.as_deref().unwrap_or("")), escape_html(query.tag.as_deref().unwrap_or("")), empty, cards);
+    let content = format!("<h1 class=\"collection-title\">Recipes</h1><section class=\"browse-panel\" aria-label=\"Search recipes\"><form class=\"search-form\" action=\"/recipes\" method=\"get\"><label>Search recipes <input type=\"search\" name=\"q\" value=\"{}\" placeholder=\"Recipe name\"></label><label>Tag <input name=\"tag\" value=\"{}\" placeholder=\"e.g. soup\"></label><button class=\"button\" type=\"submit\">Search</button>{clear}</form></section>{}<section class=\"recipe-grid\" aria-label=\"Recipes\">{}</section>", escape_html(query.q.as_deref().unwrap_or("")), escape_html(query.tag.as_deref().unwrap_or("")), empty, cards);
     Ok(public_page("Recipes", &content))
 }
 
@@ -1201,7 +1204,7 @@ async fn public_ingredients(
     } else {
         &entries
     };
-    let content = format!("<section class=\"intro\"><p class=\"eyebrow\">The pantry index</p><h1>Ingredients</h1><p class=\"lede\">Browse every canonical ingredient, including the ones waiting for their first recipe.</p></section><section class=\"ingredient-grid\" aria-label=\"Ingredients\">{content}</section>");
+    let content = format!("<h1 class=\"collection-title\">Ingredients</h1><section class=\"ingredient-grid\" aria-label=\"Ingredients\">{content}</section>");
     Ok(public_page("Ingredients", &content))
 }
 
@@ -1307,7 +1310,7 @@ async fn public_recipe(
             )
         })
         .unwrap_or_default();
-    let content = format!("<article class=\"recipe-detail\">{image}<header class=\"recipe-heading\"><p class=\"eyebrow\"><a href=\"/recipes\">The recipe book</a></p><h1>{}</h1><p class=\"lede\">{}</p><div class=\"tag-list\" aria-label=\"Recipe tags\">{tags}</div></header><div class=\"recipe-actions\"><form class=\"servings-form\" action=\"/recipes/{}\" method=\"get\"><label for=\"servings\">Servings</label><div class=\"control-row\"><input id=\"servings\" type=\"number\" name=\"servings\" min=\"1\" max=\"1000\" value=\"{}\"><button class=\"button\" type=\"submit\">Update servings</button></div><p class=\"field-hint\">Base recipe serves {}.</p></form><a class=\"button button-secondary\" href=\"/recipes/{}.pdf?servings={}\">Download printable PDF</a></div><div class=\"recipe-columns\"><section class=\"recipe-section ingredients-section\"><h2>Ingredients</h2><ul class=\"ingredient-list\">{}</ul></section><section class=\"recipe-section method-section\"><h2>Method</h2><ol class=\"method-list\">{}</ol></section></div>{}{}</article>", escape_html(&view.title), escape_html(&view.description), escape_html(id), target, view.base_servings, escape_html(id), target, ingredients, instructions, notes, source);
+    let content = format!("<article class=\"recipe-detail\"><header class=\"recipe-heading\"><h1>{}</h1><p class=\"lede\">{}</p><div class=\"tag-list\" aria-label=\"Recipe tags\">{tags}</div></header>{image}<div class=\"recipe-actions\"><form class=\"servings-form\" action=\"/recipes/{}\" method=\"get\"><label for=\"servings\">Servings</label><div class=\"control-row\"><input id=\"servings\" type=\"number\" name=\"servings\" min=\"1\" max=\"1000\" value=\"{}\"><button class=\"button\" type=\"submit\">Update servings</button></div><p class=\"field-hint\">Base recipe serves {}.</p></form><a class=\"button button-secondary\" href=\"/recipes/{}.pdf?servings={}\">Printable PDF</a></div><div class=\"recipe-columns\"><section class=\"recipe-section ingredients-section\"><h2>Ingredients</h2><ul class=\"ingredient-list\">{}</ul></section><section class=\"recipe-section method-section\"><h2>Method</h2><ol class=\"method-list\">{}</ol></section></div>{}{}</article>", escape_html(&view.title), escape_html(&view.description), escape_html(id), target, view.base_servings, escape_html(id), target, ingredients, instructions, notes, source);
     Ok(public_page(&view.title, &content))
 }
 
@@ -1333,7 +1336,7 @@ fn public_card(row: &RevisionRow) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "<article class=\"recipe-card\"><a class=\"card-link\" href=\"/recipes/{}\"><div class=\"card-image\">{image}</div><div class=\"card-copy\"><span class=\"card-kicker\">From the recipe book</span><h2 class=\"card-title\">{}</h2></div></a><div class=\"tag-list\">{tags}</div></article>",
+        "<article class=\"recipe-card\"><a class=\"card-link\" href=\"/recipes/{}\"><div class=\"card-image\">{image}</div><div class=\"card-copy\"><h2 class=\"card-title\">{}</h2></div></a><div class=\"tag-list\">{tags}</div></article>",
         escape_html(&row.recipe_id),
         escape_html(&row.title)
     )

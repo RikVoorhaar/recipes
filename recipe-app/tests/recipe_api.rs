@@ -37,10 +37,14 @@ async fn public_pages_scaled_view_and_validation_are_read_only() {
     let index = app.get("/").await;
     assert_eq!(index.status(), 200);
     let index = index.text().await.unwrap();
+    assert!(index.contains("<title>Recipes</title>"));
+    assert!(!index.contains("wordmark"));
     assert!(index.contains("Butter noodles"));
     assert!(index.contains("No picture"));
     assert!(index.contains("<div class=\"card-image\"><div class=\"placeholder\""));
-    assert!(index.contains("<div class=\"card-copy\"><span class=\"card-kicker\">"));
+    assert!(index.contains("<div class=\"card-copy\"><h2 class=\"card-title\">"));
+    assert!(!index.contains("card-kicker"));
+    assert!(!index.contains("Hearth &amp; Table"));
     assert!(index.contains("href=\"/assets/site.css\""));
     assert!(!index.contains("<style"));
     assert!(index.contains("href=\"/ingredients\""));
@@ -56,8 +60,10 @@ async fn public_pages_scaled_view_and_validation_are_read_only() {
     assert!(css.contains(".recipe-card .tag:focus-visible"));
     assert!(css.contains("outline: 3px solid #9a4f26"));
     assert!(css.contains("overflow: hidden"));
-    assert!(css.contains(".recipe-grid { display: grid; grid-template-columns: repeat(auto-fill"));
-    assert!(css.contains(".recipe-grid { grid-template-columns: repeat(auto-fill"));
+    assert!(css.contains(
+        ".recipe-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));"
+    ));
+    assert!(css.contains(".recipe-grid { grid-template-columns: 1fr;"));
     assert!(css.contains("--color-paper"));
     let font = app.get("/assets/Lora.ttf").await;
     assert_eq!(font.status(), 200);
@@ -69,8 +75,10 @@ async fn public_pages_scaled_view_and_validation_are_read_only() {
     assert_eq!(detail.status(), 200);
     let detail = detail.text().await.unwrap();
     assert!(detail.contains("name=\"viewport\""));
+    assert!(detail.contains("<title>Butter noodles</title>"));
+    assert_eq!(detail.matches(">Recipes</a>").count(), 1);
     assert!(!detail.contains("<script"));
-    assert!(detail.contains("Download printable PDF"));
+    assert!(detail.contains(">Printable PDF</a>"));
     assert!(detail.contains("value=\"4\""));
     assert!(detail.contains("400 g"));
     assert!(detail.contains("action=\"/recipes/"));
@@ -453,6 +461,7 @@ async fn public_browsing_filters_and_canonical_ingredient_directory_work_over_ht
     assert!(matching.contains("<h2 class=\"card-title\">Chicken Soup</h2>"));
     assert!(matching.contains("<h2 class=\"card-title\">Chicken Stew</h2>"));
     assert!(!matching.contains("<h2 class=\"card-title\">Chicken Variant</h2>"));
+    assert_eq!(matching.matches("Clear filters").count(), 1);
     let wrong_tag = app
         .get("/recipes?q=Chicken&tag=quick")
         .await
@@ -469,6 +478,35 @@ async fn public_browsing_filters_and_canonical_ingredient_directory_work_over_ht
     assert!(search.contains("<h2 class=\"card-title\">Chicken Stew</h2>"));
     assert!(search.contains("href=\"/recipes?tag=soup\">soup</a>"));
     assert!(search.contains("href=\"/ingredients\""));
+    assert_eq!(search.matches("Clear filters").count(), 1);
+
+    let whitespace_search = app
+        .get("/recipes?q=%20Chicken%20&tag=%20soup%20")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(whitespace_search.contains("<h2 class=\"card-title\">Chicken Soup</h2>"));
+    assert!(whitespace_search.contains("value=\" Chicken \""));
+    assert!(whitespace_search.contains("value=\" soup \""));
+    assert_eq!(whitespace_search.matches("Clear filters").count(), 1);
+    let blank_search = app
+        .get("/recipes?q=%20%20&tag=%20")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(blank_search.contains("<h2 class=\"card-title\">Chicken Soup</h2>"));
+    assert!(!blank_search.contains("Clear filters"));
+    let escaped_filter = app
+        .get("/recipes?q=%3Cscript%3E")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(escaped_filter.contains("value=\"&lt;script&gt;\""));
+    assert!(!escaped_filter.contains("value=\"<script>\""));
+    assert_eq!(escaped_filter.matches("Clear filters").count(), 1);
 
     let no_match = app
         .get("/recipes?q=does-not-exist&tag=soup")
@@ -478,10 +516,13 @@ async fn public_browsing_filters_and_canonical_ingredient_directory_work_over_ht
         .unwrap();
     assert!(no_match.contains("No recipes"));
     assert!(no_match.contains("Clear filters"));
+    assert_eq!(no_match.matches("Clear filters").count(), 1);
 
     let directory = app.get("/ingredients").await;
     assert_eq!(directory.status(), 200);
     let directory = directory.text().await.unwrap();
+    assert!(directory.contains("<title>Ingredients</title>"));
+    assert!(directory.contains("<h1 class=\"collection-title\">Ingredients</h1>"));
     let chicken = directory
         .split("<h2>chicken</h2>")
         .nth(1)

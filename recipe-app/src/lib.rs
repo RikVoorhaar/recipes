@@ -101,6 +101,8 @@ fn api_router(pool: SqlitePool, images: Arc<dyn ImageStorage>) -> Router {
         .route("/api/v1/recipes/:id/pdf", get(api_recipe_pdf))
         .route("/api/v1/recipes/validate", post(validate_recipe))
         .route("/", get(public_index))
+        .route("/recipes", get(public_index))
+        .route("/ingredients", get(public_ingredients))
         .route("/tags/:tag", get(public_tag))
         .route("/recipes/:id", get(public_recipe))
         .route("/api/v1/search", get(search_recipes))
@@ -945,7 +947,12 @@ async fn public_index(
 ) -> Result<impl IntoResponse, ApiError> {
     let rows = public_rows(&state).await?;
     let filter = query.q.as_deref().unwrap_or("").to_lowercase();
-    let tag = query.tag.as_deref().map(normalize);
+    let tag = query
+        .tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(normalize);
     let cards = rows
         .into_iter()
         .filter(|row| {
@@ -959,7 +966,80 @@ async fn public_index(
         })
         .map(|row| public_card(&row))
         .collect::<String>();
-    Ok(html(format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Recipes</title><style>*,*::before,*::after{{box-sizing:border-box}}body{{margin:0;font:1rem/1.5 system-ui,sans-serif;color:#25251f}}main{{width:min(calc(100% - 2rem),72rem);margin:auto;overflow-wrap:anywhere}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr));gap:1rem}}.card{{min-width:0;overflow:hidden;border:1px solid #ddd;border-radius:.75rem}}.card>a{{display:block;color:inherit;text-decoration:none}}.card img,.placeholder{{display:block;width:100%;aspect-ratio:4/3;object-fit:cover}}.placeholder{{display:grid;place-items:center;background:#eee}}.card h2,.card p{{margin:.75rem}}img{{max-width:100%;height:auto}}a{{overflow-wrap:anywhere}}</style><main><h1>Recipes</h1><form><label>Title <input name=\"q\" value=\"{}\"></label><label>Tag <input name=\"tag\" value=\"{}\"></label><button>Filter</button></form><section class=\"grid\">{cards}</section></main></html>", escape_html(&filter), escape_html(query.tag.as_deref().unwrap_or("")))))
+    let empty = if cards.is_empty() {
+        "<p>No recipes match these filters. <a href=\"/recipes\">Clear filters</a></p>"
+    } else {
+        ""
+    };
+    Ok(html(format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Recipes</title><style>*,*::before,*::after{{box-sizing:border-box}}body{{margin:0;font:1rem/1.5 system-ui,sans-serif;color:#25251f}}main{{width:min(calc(100% - 2rem),72rem);margin:auto;overflow-wrap:anywhere}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr));gap:1rem}}.card{{min-width:0;overflow:hidden;border:1px solid #ddd;border-radius:.75rem}}.card>a{{display:block;color:inherit;text-decoration:none}}.card img,.placeholder{{display:block;width:100%;aspect-ratio:4/3;object-fit:cover}}.placeholder{{display:grid;place-items:center;background:#eee}}.card h2,.card p{{margin:.75rem}}img{{max-width:100%;height:auto}}a{{overflow-wrap:anywhere}}</style><main><nav><a href=\"/recipes\">Recipes</a> · <a href=\"/ingredients\">Ingredients</a></nav><h1>Recipes</h1><form action=\"/recipes\"><label>Title <input name=\"q\" value=\"{}\"></label><label>Tag <input name=\"tag\" value=\"{}\"></label><button>Filter</button> <a href=\"/recipes\">Clear filters</a></form>{empty}<section class=\"grid\">{cards}</section></main></html>", escape_html(query.q.as_deref().unwrap_or("")), escape_html(query.tag.as_deref().unwrap_or("")))))
+}
+
+async fn public_ingredients(
+    State(state): State<RecipeService>,
+) -> Result<impl IntoResponse, ApiError> {
+    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT i.id, i.name, p.id, r.title
+         FROM ingredients i
+         LEFT JOIN ingredient_occurrences o ON o.ingredient_id = i.id
+         LEFT JOIN recipes p ON p.current_revision_id = o.revision_id AND p.deleted = 0
+         LEFT JOIN recipe_revisions r ON r.id = p.current_revision_id
+         WHERE i.deleted = 0 AND i.redirect_to IS NULL
+         GROUP BY i.id, p.id, r.title
+         ORDER BY i.name COLLATE NOCASE, i.id, r.title COLLATE NOCASE, p.id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal_error)?;
+    let mut items: std::collections::BTreeMap<String, (String, Vec<(String, String)>)> =
+        std::collections::BTreeMap::new();
+    for (id, name, recipe_id, title) in rows {
+        let item = items.entry(id).or_insert((name, Vec::new()));
+        if let (Some(recipe_id), Some(title)) = (recipe_id, title) {
+            item.1.push((recipe_id, title));
+        }
+    }
+    let mut items: Vec<_> = items.into_iter().collect();
+    items.sort_by(|(left_id, (left_name, _)), (right_id, (right_name, _))| {
+        normalize(left_name)
+            .cmp(&normalize(right_name))
+            .then_with(|| left_id.cmp(right_id))
+    });
+    let entries = items
+        .iter_mut()
+        .map(|(_, (name, recipes))| {
+            recipes.sort_by(|(left_id, left_title), (right_id, right_title)| {
+                normalize(left_title)
+                    .cmp(&normalize(right_title))
+                    .then_with(|| left_id.cmp(right_id))
+            });
+            let count = recipes.len();
+            let links = recipes
+                .iter()
+                .map(|(id, title)| {
+                    format!(
+                        "<li><a href=\"/recipes/{}\">{}</a></li>",
+                        escape_html(id),
+                        escape_html(title)
+                    )
+                })
+                .collect::<String>();
+            format!(
+                "<article><h2>{}</h2><p>{} {}</p><ul>{}</ul></article>",
+                escape_html(name),
+                count,
+                if count == 1 { "recipe" } else { "recipes" },
+                links
+            )
+        })
+        .collect::<String>();
+    let content = if entries.is_empty() {
+        "<p>No ingredients yet.</p>"
+    } else {
+        &entries
+    };
+    Ok(html(format!(
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Ingredients</title><main><nav><a href=\"/recipes\">Recipes</a> · <a href=\"/ingredients\">Ingredients</a></nav><h1>Ingredients</h1>{content}</main></html>"
+    )))
 }
 
 #[derive(Deserialize, Default)]

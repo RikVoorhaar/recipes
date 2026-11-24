@@ -88,6 +88,237 @@ async fn public_pages_scaled_view_and_validation_are_read_only() {
 }
 
 #[tokio::test]
+async fn public_browsing_filters_and_canonical_ingredient_directory_work_over_http() {
+    let app = support::TestApp::start().await;
+    let make = |title: &str, tags: Vec<&str>, body: &str| {
+        bearer(reqwest::Client::new().post(app.url("/api/v1/recipes")))
+            .json(&json!({"title": title, "servings": 2, "tags": tags, "body": body}))
+    };
+    let soup: Value = make(
+        "Chicken Soup",
+        vec!["soup"],
+        "@chicken{200%g}\n@chicken{50%g}\n@onion{1%piece}",
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let second: Value = make("Chicken Stew", vec!["soup", "dinner"], "@chicken{300%g}")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let unrelated: Value = make("Toast", vec!["quick"], "@bread{2%slice}")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    make(
+        "<script>alert(1)</script>",
+        vec!["soup"],
+        "@pepper\n@chicken",
+    )
+    .send()
+    .await
+    .unwrap();
+    make("Chicken Variant", vec!["dinner"], "@chickens{200%g}")
+        .send()
+        .await
+        .unwrap();
+    let soup_id = soup["recipe"]["id"].as_str().unwrap();
+    let second_id = second["recipe"]["id"].as_str().unwrap();
+    let unrelated_id = unrelated["recipe"]["id"].as_str().unwrap();
+
+    let listing = app.get("/recipes?tag=soup").await;
+    assert_eq!(
+        listing.status(),
+        200,
+        "/recipes must be a public listing route"
+    );
+    let listing = listing.text().await.unwrap();
+    assert!(listing.contains(">Chicken Soup</h2>"));
+    assert!(listing.contains(">Chicken Stew</h2>"));
+    assert!(listing.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!listing.contains("<script>alert(1)</script>"));
+    assert!(!listing.contains(">Toast</h2>"));
+    assert!(listing.contains("href=\"/recipes/"));
+    assert!(app.get("/tags/soup").await.status().is_success());
+    let matching = app
+        .get("/recipes?q=Chicken&tag=soup")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(matching.contains(">Chicken Soup</h2>"));
+    assert!(matching.contains(">Chicken Stew</h2>"));
+    assert!(!matching.contains(">Chicken Variant</h2>"));
+    let wrong_tag = app
+        .get("/recipes?q=Chicken&tag=quick")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(wrong_tag.contains("No recipes"));
+    assert!(!wrong_tag.contains(">Chicken Soup</h2>"));
+
+    let search = app.get("/?q=chicken&tag=").await;
+    assert_eq!(search.status(), 200);
+    let search = search.text().await.unwrap();
+    assert!(search.contains(">Chicken Soup</h2>"));
+    assert!(search.contains(">Chicken Stew</h2>"));
+    assert!(search.contains("href=\"/recipes?tag=soup\">soup</a>"));
+    assert!(search.contains("href=\"/ingredients\""));
+
+    let no_match = app
+        .get("/recipes?q=does-not-exist&tag=soup")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(no_match.contains("No recipes"));
+    assert!(no_match.contains("Clear filters"));
+
+    let directory = app.get("/ingredients").await;
+    assert_eq!(directory.status(), 200);
+    let directory = directory.text().await.unwrap();
+    let chicken = directory
+        .split("<h2>chicken</h2>")
+        .nth(1)
+        .unwrap()
+        .split("</article>")
+        .next()
+        .unwrap();
+    assert!(directory.contains("<h2>chicken</h2>"));
+    let headings = directory
+        .split("<h2>")
+        .skip(1)
+        .map(|section| section.split("</h2>").next().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headings,
+        ["bread", "chicken", "chickens", "onion", "pepper"]
+    );
+    assert!(chicken.contains("3 recipes"));
+    assert!(chicken.contains(&format!("/recipes/{soup_id}")));
+    assert!(chicken.contains(&format!("/recipes/{second_id}")));
+    assert!(!chicken.contains(&format!("/recipes/{unrelated_id}")));
+    assert!(directory.contains("<h2>onion</h2>"));
+    let linked_id = chicken
+        .split("href=\"/recipes/")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let linked_recipe = app.get(&format!("/recipes/{linked_id}")).await;
+    assert_eq!(linked_recipe.status(), 200);
+    let linked_recipe = linked_recipe.text().await.unwrap();
+    assert!(linked_recipe.contains("<h1>"));
+
+    let ingredients: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/ingredients")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ingredient_id = |name: &str| {
+        ingredients
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ingredient| ingredient["name"] == name)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let chicken_id = ingredient_id("chicken");
+    let chickens_id = ingredient_id("chickens");
+    let merged = bearer(
+        reqwest::Client::new().post(app.url(&format!("/api/v1/ingredients/{chickens_id}/merge"))),
+    )
+    .json(&json!({"survivor": chicken_id}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(merged.status(), 204);
+    let directory = app.get("/ingredients").await.text().await.unwrap();
+    let chicken = directory
+        .split("<h2>chicken</h2>")
+        .nth(1)
+        .unwrap()
+        .split("</article>")
+        .next()
+        .unwrap();
+    assert!(chicken.contains("4 recipes"));
+    assert!(!directory.contains("<h2>chickens</h2>"));
+    assert!(directory.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!directory.contains("<script>alert(1)</script>"));
+
+    let pepper_id = ingredient_id("pepper");
+    let renamed =
+        bearer(reqwest::Client::new().put(app.url(&format!("/api/v1/ingredients/{pepper_id}"))))
+            .json(&json!({"name":"pepper <b>hot</b>"}))
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(renamed.status(), 204);
+    let directory = app.get("/ingredients").await.text().await.unwrap();
+    assert!(directory.contains("pepper &lt;b&gt;hot&lt;/b&gt;"));
+    assert!(!directory.contains("pepper <b>hot</b>"));
+
+    let changed =
+        bearer(reqwest::Client::new().put(app.url(&format!("/api/v1/recipes/{soup_id}"))))
+            .json(&json!({
+                "title":"Chicken Soup",
+                "servings":2,
+                "tags":["soup"],
+                "body":"@rice{200%g}",
+                "base_revision":soup["recipe"]["revision"]
+            }))
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(changed.status(), 200);
+    let directory = app.get("/ingredients").await.text().await.unwrap();
+    let chicken = directory
+        .split("<h2>chicken</h2>")
+        .nth(1)
+        .unwrap()
+        .split("</article>")
+        .next()
+        .unwrap();
+    assert!(chicken.contains("3 recipes"));
+    assert!(!chicken.contains(&format!("/recipes/{soup_id}")));
+
+    let rev = second["recipe"]["revision"].as_str().unwrap();
+    let deleted =
+        bearer(reqwest::Client::new().delete(app.url(&format!("/api/v1/recipes/{second_id}"))))
+            .json(&json!({"base_revision": rev}))
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(deleted.status(), 200);
+    let directory = app.get("/ingredients").await.text().await.unwrap();
+    let chicken = directory
+        .split("<h2>chicken</h2>")
+        .nth(1)
+        .unwrap()
+        .split("</article>")
+        .next()
+        .unwrap();
+    assert!(chicken.contains("2 recipes"));
+    assert!(!chicken.contains(&format!("/recipes/{second_id}")));
+}
+
+#[tokio::test]
 async fn public_and_api_pdf_routes_share_a_deterministic_single_page_a4_render() {
     let app = support::TestApp::start().await;
     let created = create(&app).await;

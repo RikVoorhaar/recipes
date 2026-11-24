@@ -39,14 +39,42 @@ async fn public_pages_scaled_view_and_validation_are_read_only() {
     let index = index.text().await.unwrap();
     assert!(index.contains("Butter noodles"));
     assert!(index.contains("No picture"));
+    assert!(index.contains("<div class=\"card-image\"><div class=\"placeholder\""));
+    assert!(index.contains("<div class=\"card-copy\"><span class=\"card-kicker\">"));
+    assert!(index.contains("href=\"/assets/site.css\""));
+    assert!(!index.contains("<style"));
+    assert!(index.contains("href=\"/ingredients\""));
+    let css = app.get("/assets/site.css").await;
+    assert_eq!(css.status(), 200);
+    assert!(css.headers()[reqwest::header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .starts_with("text/css"));
+    let css = css.text().await.unwrap();
+    assert!(css.contains(":focus-visible"));
+    assert!(css.contains(".recipe-card:focus-within"));
+    assert!(css.contains(".recipe-card .tag:focus-visible"));
+    assert!(css.contains("outline: 3px solid #9a4f26"));
+    assert!(css.contains("overflow: hidden"));
+    assert!(css.contains(".recipe-grid { display: grid; grid-template-columns: repeat(auto-fill"));
+    assert!(css.contains(".recipe-grid { grid-template-columns: repeat(auto-fill"));
+    assert!(css.contains("--color-paper"));
+    let font = app.get("/assets/Lora.ttf").await;
+    assert_eq!(font.status(), 200);
+    assert!(font.headers()[reqwest::header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .starts_with("font/ttf"));
     let detail = app.get(&format!("/recipes/{id}?servings=4")).await;
     assert_eq!(detail.status(), 200);
     let detail = detail.text().await.unwrap();
     assert!(detail.contains("name=\"viewport\""));
     assert!(!detail.contains("<script"));
-    assert!(detail.contains("Download PDF"));
+    assert!(detail.contains("Download printable PDF"));
     assert!(detail.contains("value=\"4\""));
     assert!(detail.contains("400 g"));
+    assert!(detail.contains("action=\"/recipes/"));
+    assert!(detail.contains("id=\"servings\""));
     assert_eq!(app.get("/tags/quick").await.status(), 200);
     let scaled: Value = bearer(
         reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{id}/scaled?servings=4"))),
@@ -142,11 +170,11 @@ async fn public_browsing_filters_and_canonical_ingredient_directory_work_over_ht
         "/recipes must be a public listing route"
     );
     let listing = listing.text().await.unwrap();
-    assert!(listing.contains(">Chicken Soup</h2>"));
-    assert!(listing.contains(">Chicken Stew</h2>"));
+    assert!(listing.contains("<h2 class=\"card-title\">Chicken Soup</h2>"));
+    assert!(listing.contains("<h2 class=\"card-title\">Chicken Stew</h2>"));
     assert!(listing.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     assert!(!listing.contains("<script>alert(1)</script>"));
-    assert!(!listing.contains(">Toast</h2>"));
+    assert!(!listing.contains("<h2 class=\"card-title\">Toast</h2>"));
     assert!(listing.contains("href=\"/recipes/"));
     assert!(app.get("/tags/soup").await.status().is_success());
     let matching = app
@@ -155,9 +183,9 @@ async fn public_browsing_filters_and_canonical_ingredient_directory_work_over_ht
         .text()
         .await
         .unwrap();
-    assert!(matching.contains(">Chicken Soup</h2>"));
-    assert!(matching.contains(">Chicken Stew</h2>"));
-    assert!(!matching.contains(">Chicken Variant</h2>"));
+    assert!(matching.contains("<h2 class=\"card-title\">Chicken Soup</h2>"));
+    assert!(matching.contains("<h2 class=\"card-title\">Chicken Stew</h2>"));
+    assert!(!matching.contains("<h2 class=\"card-title\">Chicken Variant</h2>"));
     let wrong_tag = app
         .get("/recipes?q=Chicken&tag=quick")
         .await
@@ -165,13 +193,13 @@ async fn public_browsing_filters_and_canonical_ingredient_directory_work_over_ht
         .await
         .unwrap();
     assert!(wrong_tag.contains("No recipes"));
-    assert!(!wrong_tag.contains(">Chicken Soup</h2>"));
+    assert!(!wrong_tag.contains("<h2 class=\"card-title\">Chicken Soup</h2>"));
 
     let search = app.get("/?q=chicken&tag=").await;
     assert_eq!(search.status(), 200);
     let search = search.text().await.unwrap();
-    assert!(search.contains(">Chicken Soup</h2>"));
-    assert!(search.contains(">Chicken Stew</h2>"));
+    assert!(search.contains("<h2 class=\"card-title\">Chicken Soup</h2>"));
+    assert!(search.contains("<h2 class=\"card-title\">Chicken Stew</h2>"));
     assert!(search.contains("href=\"/recipes?tag=soup\">soup</a>"));
     assert!(search.contains("href=\"/ingredients\""));
 

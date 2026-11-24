@@ -103,6 +103,8 @@ fn api_router(pool: SqlitePool, images: Arc<dyn ImageStorage>) -> Router {
         .route("/", get(public_index))
         .route("/recipes", get(public_index))
         .route("/ingredients", get(public_ingredients))
+        .route("/assets/site.css", get(public_stylesheet))
+        .route("/assets/Lora.ttf", get(public_font))
         .route("/tags/:tag", get(public_tag))
         .route("/recipes/:id", get(public_recipe))
         .route("/api/v1/search", get(search_recipes))
@@ -941,6 +943,27 @@ fn safe_source_url(value: &str) -> Option<&str> {
     .then_some(value)
 }
 
+async fn public_stylesheet() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../assets/site.css"),
+    )
+}
+
+async fn public_font() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "font/ttf")],
+        include_bytes!("../assets/Lora.ttf").as_slice(),
+    )
+}
+
+fn public_page(title: &str, content: &str) -> Response {
+    html(format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light\"><title>{} · Hearth &amp; Table</title><link rel=\"stylesheet\" href=\"/assets/site.css\"></head><body><a class=\"skip-link\" href=\"#main\">Skip to content</a><header class=\"site-header\"><a class=\"wordmark\" href=\"/recipes\" aria-label=\"Hearth and Table home\">Hearth <span>&amp;</span> Table</a><nav class=\"site-nav\" aria-label=\"Main navigation\"><a href=\"/recipes\">Recipes</a><a href=\"/ingredients\">Ingredients</a></nav></header><main id=\"main\">{}</main><footer class=\"site-footer\"><span>Made for the kitchen table.</span><a href=\"/recipes\">Browse the recipe book</a></footer></body></html>",
+        escape_html(title), content
+    ))
+}
+
 async fn public_index(
     State(state): State<RecipeService>,
     Query(query): Query<PublicFilter>,
@@ -967,11 +990,22 @@ async fn public_index(
         .map(|row| public_card(&row))
         .collect::<String>();
     let empty = if cards.is_empty() {
-        "<p>No recipes match these filters. <a href=\"/recipes\">Clear filters</a></p>"
+        "<p class=\"empty-notice\">No recipes match these filters. <a href=\"/recipes\">Clear filters</a></p>"
     } else {
         ""
     };
-    Ok(html(format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Recipes</title><style>*,*::before,*::after{{box-sizing:border-box}}body{{margin:0;font:1rem/1.5 system-ui,sans-serif;color:#25251f}}main{{width:min(calc(100% - 2rem),72rem);margin:auto;overflow-wrap:anywhere}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr));gap:1rem}}.card{{min-width:0;overflow:hidden;border:1px solid #ddd;border-radius:.75rem}}.card>a{{display:block;color:inherit;text-decoration:none}}.card img,.placeholder{{display:block;width:100%;aspect-ratio:4/3;object-fit:cover}}.placeholder{{display:grid;place-items:center;background:#eee}}.card h2,.card p{{margin:.75rem}}img{{max-width:100%;height:auto}}a{{overflow-wrap:anywhere}}</style><main><nav><a href=\"/recipes\">Recipes</a> · <a href=\"/ingredients\">Ingredients</a></nav><h1>Recipes</h1><form action=\"/recipes\"><label>Title <input name=\"q\" value=\"{}\"></label><label>Tag <input name=\"tag\" value=\"{}\"></label><button>Filter</button> <a href=\"/recipes\">Clear filters</a></form>{empty}<section class=\"grid\">{cards}</section></main></html>", escape_html(query.q.as_deref().unwrap_or("")), escape_html(query.tag.as_deref().unwrap_or("")))))
+    let heading = if tag.is_some() {
+        "Recipes to savor"
+    } else {
+        "A well-loved collection"
+    };
+    let intro = if tag.is_some() {
+        "A little collection, gathered by tag."
+    } else {
+        "Good things to cook, share, and come back to."
+    };
+    let content = format!("<section class=\"intro\"><p class=\"eyebrow\">From our kitchen</p><h1>{heading}</h1><p class=\"lede\">{intro}</p></section><section class=\"browse-panel\" aria-labelledby=\"browse-heading\"><h2 id=\"browse-heading\">Find something good</h2><form class=\"search-form\" action=\"/recipes\" method=\"get\"><label>Recipe title <input type=\"search\" name=\"q\" value=\"{}\" placeholder=\"Try soup\"></label><label>Tag <input name=\"tag\" value=\"{}\" placeholder=\"Try weeknight\"></label><button class=\"button\" type=\"submit\">Find recipes</button><a class=\"text-link\" href=\"/recipes\">Clear filters</a></form></section>{}<section class=\"recipe-grid\" aria-label=\"Recipes\">{}</section>", escape_html(query.q.as_deref().unwrap_or("")), escape_html(query.tag.as_deref().unwrap_or("")), empty, cards);
+    Ok(public_page("Recipes", &content))
 }
 
 async fn public_ingredients(
@@ -1024,22 +1058,25 @@ async fn public_ingredients(
                 })
                 .collect::<String>();
             format!(
-                "<article><h2>{}</h2><p>{} {}</p><ul>{}</ul></article>",
+                "<article class=\"ingredient-card\"><h2>{}</h2><p class=\"usage-count\">{} {}</p>{}</article>",
                 escape_html(name),
                 count,
                 if count == 1 { "recipe" } else { "recipes" },
-                links
+                if links.is_empty() {
+                    "<p class=\"quiet\">Not yet used in a recipe.</p>".to_owned()
+                } else {
+                    format!("<details class=\"ingredient-uses\"><summary>Browse recipes</summary><ul class=\"ingredient-recipes\">{links}</ul></details>")
+                }
             )
         })
         .collect::<String>();
     let content = if entries.is_empty() {
-        "<p>No ingredients yet.</p>"
+        "<p class=\"empty-notice\">No ingredients yet.</p>"
     } else {
         &entries
     };
-    Ok(html(format!(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Ingredients</title><main><nav><a href=\"/recipes\">Recipes</a> · <a href=\"/ingredients\">Ingredients</a></nav><h1>Ingredients</h1>{content}</main></html>"
-    )))
+    let content = format!("<section class=\"intro\"><p class=\"eyebrow\">The pantry index</p><h1>Ingredients</h1><p class=\"lede\">Browse every canonical ingredient, including the ones waiting for their first recipe.</p></section><section class=\"ingredient-grid\" aria-label=\"Ingredients\">{content}</section>");
+    Ok(public_page("Ingredients", &content))
 }
 
 #[derive(Deserialize, Default)]
@@ -1084,7 +1121,7 @@ async fn public_recipe(
         .as_ref()
         .map(|image| {
             format!(
-                "<img class=\"hero\" src=\"{}\" alt=\"\">",
+                "<img class=\"recipe-cover\" src=\"{}\" alt=\"\">",
                 escape_html(&image.url)
             )
         })
@@ -1115,7 +1152,7 @@ async fn public_recipe(
         .iter()
         .map(|tag| {
             format!(
-                "<a href=\"/recipes?tag={}\">{}</a>",
+                "<a class=\"tag\" href=\"/recipes?tag={}\">{}</a>",
                 query_component(tag),
                 escape_html(tag)
             )
@@ -1128,7 +1165,7 @@ async fn public_recipe(
         .and_then(safe_source_url)
         .map(|url| {
             format!(
-                "<p><a rel=\"noopener noreferrer\" href=\"{}\">Source</a></p>",
+                "<p class=\"recipe-source\"><a rel=\"noopener noreferrer\" href=\"{}\">View original source</a></p>",
                 escape_html(url)
             )
         })
@@ -1139,12 +1176,13 @@ async fn public_recipe(
         .filter(|notes| !notes.is_empty())
         .map(|notes| {
             format!(
-                "<section><h2>Notes</h2><p>{}</p></section>",
+                "<section class=\"recipe-section notes-section\"><h2>Notes</h2><p>{}</p></section>",
                 escape_html(notes)
             )
         })
         .unwrap_or_default();
-    Ok(html(format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>{}</title><style>*,*::before,*::after{{box-sizing:border-box}}body{{margin:0;font:1rem/1.5 system-ui,sans-serif;color:#25251f}}main{{width:min(calc(100% - 2rem),54rem);margin:auto;overflow-wrap:anywhere}}img{{display:block;max-width:100%;height:auto}}.hero{{width:100%;max-height:60vh;object-fit:cover}}a{{overflow-wrap:anywhere}}</style><main>{image}<h1>{}</h1><p>{}</p><p>{tags}</p><form><label>Servings <input type=\"number\" name=\"servings\" min=\"1\" max=\"1000\" value=\"{}\"></label><button>Scale</button></form><h2>Ingredients</h2><ul>{ingredients}</ul><h2>Method</h2><ol>{instructions}</ol>{notes}{source}<a href=\"/recipes/{}.pdf?servings={}\">Download PDF</a></main></html>", escape_html(&view.title), escape_html(&view.title), escape_html(&view.description), target, id, target)))
+    let content = format!("<article class=\"recipe-detail\">{image}<header class=\"recipe-heading\"><p class=\"eyebrow\"><a href=\"/recipes\">The recipe book</a></p><h1>{}</h1><p class=\"lede\">{}</p><div class=\"tag-list\" aria-label=\"Recipe tags\">{tags}</div></header><div class=\"recipe-actions\"><form class=\"servings-form\" action=\"/recipes/{}\" method=\"get\"><label for=\"servings\">Servings</label><div class=\"control-row\"><input id=\"servings\" type=\"number\" name=\"servings\" min=\"1\" max=\"1000\" value=\"{}\"><button class=\"button\" type=\"submit\">Update servings</button></div><p class=\"field-hint\">Base recipe serves {}.</p></form><a class=\"button button-secondary\" href=\"/recipes/{}.pdf?servings={}\">Download printable PDF</a></div><div class=\"recipe-columns\"><section class=\"recipe-section ingredients-section\"><h2>Ingredients</h2><ul class=\"ingredient-list\">{}</ul></section><section class=\"recipe-section method-section\"><h2>Method</h2><ol class=\"method-list\">{}</ol></section></div>{}{}</article>", escape_html(&view.title), escape_html(&view.description), escape_html(id), target, view.base_servings, escape_html(id), target, ingredients, instructions, notes, source);
+    Ok(public_page(&view.title, &content))
 }
 
 fn public_card(row: &RevisionRow) -> String {
@@ -1161,7 +1199,7 @@ fn public_card(row: &RevisionRow) -> String {
         .iter()
         .map(|tag| {
             format!(
-                "<a href=\"/recipes?tag={}\">{}</a>",
+                "<a class=\"tag\" href=\"/recipes?tag={}\">{}</a>",
                 query_component(tag),
                 escape_html(tag)
             )
@@ -1169,7 +1207,7 @@ fn public_card(row: &RevisionRow) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "<article class=\"card\"><a href=\"/recipes/{}\">{image}<h2>{}</h2></a><p>{tags}</p></article>",
+        "<article class=\"recipe-card\"><a class=\"card-link\" href=\"/recipes/{}\"><div class=\"card-image\">{image}</div><div class=\"card-copy\"><span class=\"card-kicker\">From the recipe book</span><h2 class=\"card-title\">{}</h2></div></a><div class=\"tag-list\">{tags}</div></article>",
         escape_html(&row.recipe_id),
         escape_html(&row.title)
     )

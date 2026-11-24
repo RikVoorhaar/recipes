@@ -19,7 +19,11 @@ use cooklang::CooklangParser;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
-use std::{io, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    sync::Arc,
+};
 use storage::{FileImageStorage, ImageStorage};
 use subtle::ConstantTimeEq;
 use unicode_casefold::UnicodeCaseFold;
@@ -634,46 +638,87 @@ fn scaled_view(
     if target != base {
         recipe.scale(target as f64 / base as f64, state.parser.converter());
     }
+    let declaration_notes =
+        leading_declaration_block(&state.parser, &row.body, &recipe).unwrap_or_default();
+    let declared_names = declaration_notes
+        .keys()
+        .filter_map(|index| recipe.ingredients.get(*index))
+        .map(|ingredient| normalize(&ingredient.display_name()))
+        .collect::<HashSet<_>>();
     let ingredients = recipe
         .ingredients
         .iter()
-        .map(|ingredient| ScaledIngredient {
-            name: ingredient.display_name().into_owned(),
-            quantity: ingredient.quantity.as_ref().map(format_quantity),
-            note: ingredient.note.clone(),
+        .enumerate()
+        .filter_map(|(index, ingredient)| {
+            if ingredient.quantity.is_none()
+                && ingredient.note.as_deref().is_none_or(str::is_empty)
+                && !declaration_notes.contains_key(&index)
+                && declared_names.contains(&normalize(&ingredient.display_name()))
+            {
+                return None;
+            }
+            let name = ingredient.display_name().into_owned();
+            let note = match (
+                ingredient.note.as_deref(),
+                declaration_notes
+                    .get(&index)
+                    .filter(|note| !note.is_empty())
+                    .map(String::as_str),
+            ) {
+                (Some(existing), Some(declaration)) if !existing.is_empty() => {
+                    Some(format!("{existing}; {declaration}"))
+                }
+                (Some(existing), _) if !existing.is_empty() => Some(existing.to_owned()),
+                (_, Some(declaration)) => Some(declaration.to_owned()),
+                _ => None,
+            };
+            Some(ScaledIngredient {
+                name,
+                quantity: ingredient.quantity.as_ref().map(format_quantity),
+                note,
+            })
         })
         .collect();
+    // Cooklang parses a leading declaration block as a step; omit only one
+    // verified against standalone source lines.
+    let has_leading_ingredient_declarations = !declaration_notes.is_empty();
     let instructions = recipe
         .sections
         .iter()
         .flat_map(|section| section.content.iter())
-        .map(|content| match content {
-            cooklang::Content::Step(step) => step
-                .items
-                .iter()
-                .map(|item| match item {
-                    cooklang::Item::Text { value } => value.clone(),
-                    cooklang::Item::Ingredient { index } => {
-                        recipe.ingredients[*index].display_name().into_owned()
-                    }
-                    cooklang::Item::Cookware { index } => recipe.cookware[*index].name.clone(),
-                    cooklang::Item::Timer { index } => {
-                        let timer = &recipe.timers[*index];
-                        match (&timer.name, &timer.quantity) {
-                            (Some(name), Some(quantity)) => {
-                                format!("{name} ({quantity})")
-                            }
-                            (Some(name), None) => name.clone(),
-                            (None, Some(quantity)) => quantity.to_string(),
-                            (None, None) => String::new(),
+        .enumerate()
+        .filter_map(|(index, content)| {
+            if index == 0 && has_leading_ingredient_declarations {
+                return None;
+            }
+            Some(match content {
+                cooklang::Content::Step(step) => step
+                    .items
+                    .iter()
+                    .map(|item| match item {
+                        cooklang::Item::Text { value } => value.clone(),
+                        cooklang::Item::Ingredient { index } => {
+                            recipe.ingredients[*index].display_name().into_owned()
                         }
-                    }
-                    cooklang::Item::InlineQuantity { index } => {
-                        recipe.inline_quantities[*index].to_string()
-                    }
-                })
-                .collect::<String>(),
-            cooklang::Content::Text(value) => value.clone(),
+                        cooklang::Item::Cookware { index } => recipe.cookware[*index].name.clone(),
+                        cooklang::Item::Timer { index } => {
+                            let timer = &recipe.timers[*index];
+                            match (&timer.name, &timer.quantity) {
+                                (Some(name), Some(quantity)) => {
+                                    format!("{name} ({quantity})")
+                                }
+                                (Some(name), None) => name.clone(),
+                                (None, Some(quantity)) => quantity.to_string(),
+                                (None, None) => String::new(),
+                            }
+                        }
+                        cooklang::Item::InlineQuantity { index } => {
+                            recipe.inline_quantities[*index].to_string()
+                        }
+                    })
+                    .collect::<String>(),
+                cooklang::Content::Text(value) => value.clone(),
+            })
         })
         .collect();
     Ok(ScaledRecipe {
@@ -692,6 +737,87 @@ fn scaled_view(
         notes: row.notes.clone(),
         source_url: row.source_url.clone(),
     })
+}
+
+fn leading_declaration_block(
+    parser: &CooklangParser,
+    body: &str,
+    recipe: &cooklang::Recipe,
+) -> Option<HashMap<usize, String>> {
+    let mut declarations = Vec::new();
+    for line in body.lines().take_while(|line| !line.trim().is_empty()) {
+        if line.trim() != line {
+            return None;
+        }
+        let parsed = parser.parse(line).into_output()?;
+        if parsed.sections.len() != 1
+            || parsed.sections[0].name.is_some()
+            || parsed.sections[0].content.len() != 1
+            || parsed.ingredients.len() != 1
+        {
+            return None;
+        }
+        let cooklang::Content::Step(step) = &parsed.sections[0].content[0] else {
+            return None;
+        };
+        let mut ingredient_index = None;
+        let mut note = None;
+        for item in &step.items {
+            match item {
+                cooklang::Item::Ingredient { index } if ingredient_index.is_none() => {
+                    ingredient_index = Some(*index);
+                }
+                cooklang::Item::Text { value } if note.is_none() && is_prep_annotation(value) => {
+                    let annotation = value.trim().strip_prefix(',')?.trim();
+                    if !annotation.is_empty() {
+                        note = Some(annotation.to_owned());
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let source_ingredient = &parsed.ingredients[ingredient_index?];
+        declarations.push((source_ingredient.display_name().into_owned(), note));
+    }
+    if declarations.len() < 2 {
+        return None;
+    }
+
+    let first_step = match recipe.sections.first()?.content.first()? {
+        cooklang::Content::Step(step) => step,
+        cooklang::Content::Text(_) => return None,
+    };
+    let mut recipe_indices = Vec::new();
+    for item in &first_step.items {
+        match item {
+            cooklang::Item::Ingredient { index } => recipe_indices.push(*index),
+            cooklang::Item::Text { value } if is_prep_annotation(value) => {}
+            _ => return None,
+        }
+    }
+    if recipe_indices.len() != declarations.len() {
+        return None;
+    }
+
+    let mut notes = HashMap::new();
+    for (index, (name, note)) in recipe_indices.into_iter().zip(declarations) {
+        if recipe.ingredients.get(index)?.display_name() != name {
+            return None;
+        }
+        notes.insert(index, note.unwrap_or_default());
+    }
+    Some(notes)
+}
+
+fn is_prep_annotation(value: &str) -> bool {
+    let value = value.trim();
+    let Some(note) = value.strip_prefix(',') else {
+        return value.is_empty();
+    };
+    matches!(
+        note.trim().to_ascii_lowercase().as_str(),
+        "diced" | "sliced" | "minced" | "bone-in" | "chopped"
+    )
 }
 
 fn format_quantity(quantity: &cooklang::quantity::Quantity) -> String {

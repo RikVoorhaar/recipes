@@ -116,6 +116,273 @@ async fn public_pages_scaled_view_and_validation_are_read_only() {
 }
 
 #[tokio::test]
+async fn ingredient_prologue_does_not_duplicate_rows_or_render_as_a_method_step() {
+    let app = support::TestApp::start().await;
+    let body = "@olive oil{15%ml}\n@onion{1}, diced\n@carrot{2}, sliced\n@celery stalk{2}, sliced\n@garlic clove{2}, minced\n@chicken thigh{600%g}, bone-in\n@chicken stock{1.5%l}\n@bay leaf{1}\n@thyme{2%sprig}\n@salt{1%tsp}\n@black pepper{0.5%tsp}\n@egg noodle{150%g}\n@parsley{10%g}, chopped\n\nHeat @olive oil{} in a large pot over medium heat. Add @onion{}, @carrot{}, and @celery stalk{}; cook until softened. Stir in @garlic clove{} briefly.\n\nAdd @chicken thigh{}, @chicken stock{}, @bay leaf{}, @thyme{}, @salt{}, and @black pepper{}. Bring to a boil, then reduce to a gentle simmer. Cover and cook until the chicken is tender and reaches 74°C at its thickest point.\n\nRemove the chicken. Add @egg noodle{} to the pot and cook until tender according to the package directions. Discard the chicken skin and bones, shred the meat, and return it to the pot. Remove the bay leaf and thyme stems, stir in @parsley{}, and adjust seasoning.";
+    let created: Value = bearer(reqwest::Client::new().post(app.url("/api/v1/recipes")))
+        .json(&json!({
+            "title": "Chicken Soup",
+            "description": "A comforting chicken soup with vegetables, noodles, and fresh parsley.",
+            "servings": 4,
+            "tags": ["soup", "chicken", "comfort food"],
+            "body": body
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["recipe"]["id"].as_str().unwrap();
+    let scaled: Value = bearer(
+        reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{id}/scaled?servings=8"))),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let ingredients = scaled["ingredients"].as_array().unwrap();
+    assert_eq!(
+        ingredients.len(),
+        13,
+        "prologue quantities must not be duplicated"
+    );
+    assert_eq!(ingredients[0]["name"], "olive oil");
+    assert_eq!(ingredients[0]["quantity"], "30 ml");
+    assert_eq!(ingredients[1]["note"], "diced");
+    assert_eq!(ingredients[5]["name"], "chicken thigh");
+    assert_eq!(ingredients[5]["quantity"], "1 2/10 kg");
+    assert_eq!(ingredients[5]["note"], "bone-in");
+    let instructions = scaled["instructions"].as_array().unwrap();
+    assert_eq!(
+        instructions.len(),
+        3,
+        "the declaration prologue is not a method step"
+    );
+    assert!(instructions[0]
+        .as_str()
+        .unwrap()
+        .starts_with("Heat olive oil in a large pot"));
+
+    let html = app
+        .get(&format!("/recipes/{id}?servings=8"))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("Heat olive oil in a large pot"));
+    assert!(html.contains("onion — diced"));
+    assert!(!html.contains("olive oil onion, diced carrot, sliced"));
+
+    let pdf = app
+        .get(&format!("/recipes/{id}.pdf?servings=8"))
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let document = lopdf::Document::load_mem(&pdf).unwrap();
+    assert_eq!(document.get_pages().len(), 1);
+    let pdf_text = pdf_extract::extract_text_from_mem(&pdf).unwrap();
+    assert!(pdf_text.contains("Heat olive oil in a large pot"));
+    assert!(pdf_text.contains("diced"));
+    assert!(!pdf_text.contains("olive oil onion, diced carrot, sliced"));
+}
+
+#[tokio::test]
+async fn ingredient_only_recipes_and_distinct_measured_occurrences_are_preserved() {
+    let app = support::TestApp::start().await;
+    let create = |title: &str, body: &str| {
+        bearer(reqwest::Client::new().post(app.url("/api/v1/recipes")))
+            .json(&json!({"title": title, "servings": 2, "body": body}))
+    };
+
+    let ingredient_only: Value = create(
+        "Ingredient-only sauce",
+        "@butter{20%g}\n@flour{100%g}\n@milk{200%ml}",
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let id = ingredient_only["recipe"]["id"].as_str().unwrap();
+    let scaled: Value =
+        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{id}/scaled"))))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(scaled["ingredients"].as_array().unwrap().len(), 3);
+    assert!(scaled["instructions"].as_array().unwrap().is_empty());
+
+    let unspecified: Value = create("Unquantified ingredients", "@salt\n@pepper")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = unspecified["recipe"]["id"].as_str().unwrap();
+    let scaled: Value =
+        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{id}/scaled"))))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(scaled["ingredients"].as_array().unwrap().len(), 2);
+    assert!(scaled["instructions"].as_array().unwrap().is_empty());
+
+    let measured: Value = create(
+        "Measured sauce",
+        "For the base use @butter{20%g} and @butter{10%g}. Melt @butter{} in #saucepan{} for ~{1%minute}, then add @flour{15%g} and whisk in @milk{200%ml}.",
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let id = measured["recipe"]["id"].as_str().unwrap();
+    let scaled: Value =
+        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{id}/scaled"))))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let ingredients = scaled["ingredients"].as_array().unwrap();
+    assert_eq!(ingredients.len(), 5);
+    assert_eq!(
+        ingredients
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["butter", "butter", "butter", "flour", "milk"]
+    );
+    assert_eq!(
+        ingredients
+            .iter()
+            .map(|item| item["quantity"].as_str())
+            .collect::<Vec<_>>(),
+        [
+            Some("20 g"),
+            Some("10 g"),
+            None,
+            Some("15 g"),
+            Some("200 ml")
+        ]
+    );
+    let instructions = scaled["instructions"].as_array().unwrap();
+    assert_eq!(instructions.len(), 1);
+    assert!(instructions[0].as_str().unwrap().contains("saucepan"));
+    assert!(instructions[0].as_str().unwrap().contains("1 minute"));
+}
+
+#[tokio::test]
+async fn declaration_detection_is_structural_and_only_suppresses_block_references() {
+    let app = support::TestApp::start().await;
+    let create = |title: &str, body: &str| {
+        bearer(reqwest::Client::new().post(app.url("/api/v1/recipes")))
+            .json(&json!({"title": title, "servings": 1, "body": body}))
+    };
+
+    let instruction: Value = create(
+        "Fried onion",
+        "@onion{1}, fry until golden\n\nServe the onion.",
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let id = instruction["recipe"]["id"].as_str().unwrap();
+    let scaled: Value =
+        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{id}/scaled"))))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(scaled["ingredients"].as_array().unwrap().len(), 1);
+    let instructions = scaled["instructions"].as_array().unwrap();
+    assert_eq!(instructions.len(), 2);
+    assert!(instructions[0]
+        .as_str()
+        .unwrap()
+        .contains("fry until golden"));
+    assert!(instructions[1]
+        .as_str()
+        .unwrap()
+        .contains("Serve the onion"));
+
+    let repeated: Value = create(
+        "Repeated onions",
+        "Add @onion{}(diced) to the pan. Stir in @onion{}(thinly sliced).",
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let id = repeated["recipe"]["id"].as_str().unwrap();
+    let scaled: Value =
+        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{id}/scaled"))))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let ingredients = scaled["ingredients"].as_array().unwrap();
+    assert_eq!(
+        ingredients.len(),
+        2,
+        "ordinary repeated references are not deduplicated"
+    );
+    assert_eq!(ingredients[0]["note"], "diced");
+    assert_eq!(ingredients[1]["note"], "thinly sliced");
+
+    let declared_then_prepped: Value = create(
+        "Onion occurrences",
+        "@onion{1}\n@salt{1%pinch}\n\nAdd @onion{}(thinly sliced) to the pan.",
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let id = declared_then_prepped["recipe"]["id"].as_str().unwrap();
+    let scaled: Value =
+        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{id}/scaled"))))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let ingredients = scaled["ingredients"].as_array().unwrap();
+    assert_eq!(
+        ingredients.len(),
+        3,
+        "a meaningful later occurrence note keeps its own row"
+    );
+    assert_eq!(ingredients[2]["name"], "onion");
+    assert_eq!(ingredients[2]["note"], "thinly sliced");
+}
+
+#[tokio::test]
 async fn public_browsing_filters_and_canonical_ingredient_directory_work_over_http() {
     let app = support::TestApp::start().await;
     let make = |title: &str, tags: Vec<&str>, body: &str| {

@@ -1,0 +1,132 @@
+[
+  {
+    "title": "Chicken Soup",
+    "description": "A comforting chicken soup with vegetables, noodles, and fresh parsley.",
+    "servings": 4,
+    "tags": [
+      "soup",
+      "chicken",
+      "comfort food"
+    ],
+    "source_url": null,
+    "notes": null,
+    "body": "@olive oil{15%ml}\n@onion{1}, diced\n@carrot{2}, sliced\n@celery stalk{2}, sliced\n@garlic clove{2}, minced\n@chicken thigh{600%g}, bone-in\n@chicken stock{1.5%l}\n@bay leaf{1}\n@thyme{2%sprig}\n@salt{1%tsp}\n@black pepper{0.5%tsp}\n@egg noodle{150%g}\n@parsley{10%g}, chopped\n\nHeat @olive oil{} in a large pot over medium heat. Add @onion{}, @carrot{}, and @celery stalk{}; cook until softened. Stir in @garlic clove{} briefly.\n\nAdd @chicken thigh{}, @chicken stock{}, @bay leaf{}, @thyme{}, @salt{}, and @black pepper{}. Bring to a boil, then reduce to a gentle simmer. Cover and cook until the chicken is tender and reaches 74°C at its thickest point.\n\nRemove the chicken. Add @egg noodle{} to the pot and cook until tender according to the package directions. Discard the chicken skin and bones, shred the meat, and return it to the pot. Remove the bay leaf and thyme stems, stir in @parsley{}, and adjust seasoning."
+  },
+  {
+    "title": "Beef and Carrot Stew",
+    "description": "Slow-simmered beef and carrots in a savory red-wine broth.",
+    "servings": 4,
+    "tags": [
+      "stew",
+      "beef",
+      "dinner"
+    ],
+    "source_url": null,
+    "notes": "For best texture, keep the stew at a quiet simmer rather than a rolling boil.",
+    "body": "Pat @beef chuck{700%g} dry and season with @salt{1%tsp} and @black pepper{0.5%tsp}. Brown in batches in a heavy pot with @olive oil{15%ml}, then set aside. Soften @onion{1} and @carrot{3} in the pot; stir in @garlic clove{2} and @tomato paste{20%g}.\n\nStir in @plain flour{15%g}, then gradually add @red wine{250%ml} and @beef stock{500%ml}, scraping the pot. Return the beef with @bay leaf{1} and @thyme{2%sprig}. Cover and simmer gently until the beef is tender, about 2 hours; add a splash of water if needed. Remove the herbs and adjust seasoning."
+  },
+  {
+    "title": "Spinach and Ricotta Lasagne",
+    "description": "A layered pasta bake with spinach, ricotta, tomato sauce and browned mozzarella.",
+    "servings": 6,
+    "tags": [
+      "bake",
+      "vegetarian",
+      "pasta"
+    ],
+    "source_url": null,
+    "notes": "Use oven-ready sheets only if their package directions match the sauce amount.",
+    "body": "Heat @olive oil{15%ml} in a pan and soften @onion{1}. Add @garlic clove{2}, @crushed tomato{800%g}, @dried oregano{1%tsp}, @salt{1%tsp} and @black pepper{0.5%tsp}; simmer 20 minutes. Wilt @spinach{300%g}, cool, squeeze dry and chop. Mix it with @ricotta{400%g}, @egg{1} and half of @parmesan{50%g}.\n\nHeat oven to 190°C conventional (170°C fan). Spread a little tomato sauce in a baking dish. Layer @lasagne sheet{250%g}, the ricotta mixture and sauce, finishing with sauce; cover with @mozzarella{150%g} and the remaining parmesan. Bake 35–40 minutes until bubbling and browned. Rest 10 minutes before serving."
+  },
+  {
+    "title": "No-Knead Country Bread",
+    "description": "A crusty round loaf with an open, chewy crumb made with a long room-temperature rise.",
+    "servings": 8,
+    "tags": [
+      "bread",
+      "baking",
+      "vegetarian"
+    ],
+    "source_url": null,
+    "notes": "Dough hydration is high; use wet hands for folds. Oven temperatures are suggestions for a home oven.",
+    "body": "Mix @bread flour{500%g}, @water{375%ml}, @instant yeast{1%g} and @salt{10%g} until no dry flour remains. Cover and rest 30 minutes. With a damp hand, pull an edge of dough up and fold it over; rotate and repeat on all four sides. Cover and leave at room temperature until roughly doubled, about 8–12 hours.\n\nTurn onto a lightly floured surface, shape into a tight round and rest seam-side down under a towel for 30 minutes. Meanwhile heat a lidded Dutch oven at 230°C conventional (210°C fan) for 30 minutes. Carefully transfer dough seam-side up into the hot pot, cover and bake 30 minutes; uncover and bake 15–20 minutes until deep golden. The centre should reach about 96°C. Cool fully on a rack before slicing."
+  },
+  {
+    "title": "Chickpea, Cucumber and Feta Salad",
+    "description": "A crisp, lemony salad of chickpeas, cucumber, tomato, herbs and salty feta.",
+    "servings": 4,
+    "tags": [
+      "salad",
+      "vegetarian",
+      "quick"
+    ],
+    "source_url": null,
+    "notes": null,
+    "body": "Whisk @lemon juice{30%ml} with @extra-virgin olive oil{30%ml}, @salt{0.5%tsp} and @black pepper{0.25%tsp}. Toss @chickpea{2%can}, drained and rinsed, with @cucumber{1}, @cherry tomato{200%g}, @red onion{0.5} and @parsley{15%g}; coat with the dressing. Fold in @feta{100%g} gently. Taste and adjust the seasoning; serve promptly or chill briefly."
+  },
+  {
+    "title": "Chicken Piccata with Lemon-Caper Sauce",
+    "description": "Golden chicken cutlets finished in a bright pan sauce of lemon, capers and butter.",
+    "servings": 4,
+    "tags": [
+      "chicken",
+      "sauced",
+      "dinner"
+    ],
+    "source_url": null,
+    "notes": "Chicken cutlets should reach 74°C at the thickest point.",
+    "body": "Season @chicken breast{600%g}, sliced horizontally into 4 cutlets, with @salt{0.75%tsp} and @black pepper{0.25%tsp}; dredge lightly in @plain flour{40%g}. Heat @olive oil{30%ml} and half of @butter{40%g} in a wide pan. Cook the chicken in batches until golden and 74°C at the thickest point; transfer to a plate.\n\nAdd @chicken stock{150%ml}, @lemon juice{30%ml} and @capers{25%g}, drained, to the pan, scraping up browned bits. Simmer until slightly reduced. Whisk in the remaining butter off the heat, return chicken and juices to the pan, and turn to coat. Scatter @parsley{10%g} over the sauce and serve."
+  },
+  {
+    "title": "Mushroom and Barley Risotto",
+    "description": "Pearl barley cooked until tender in mushroom stock, finished with parmesan.",
+    "servings": 4,
+    "tags": [
+      "vegetarian",
+      "grain",
+      "dinner"
+    ],
+    "source_url": null,
+    "notes": "Pearl barley takes longer than rice; add hot stock gradually and taste for tenderness.",
+    "body": "Warm @olive oil{20%ml} and @butter{20%g} in a broad pan. Brown @mixed mushroom{300%g} in batches; reserve. Soften @onion{1}, add @garlic clove{2} briefly, then stir in @pearl barley{250%g} until glossy. Pour in @white wine{100%ml} and stir until mostly absorbed.\n\nAdd hot @vegetable stock{900%ml} one ladle at a time, stirring often and allowing each addition to absorb before adding more. Continue until barley is tender with a slight bite, 35–45 minutes; add hot water if stock runs short. Fold in the mushrooms and @parmesan{50%g}, season with @salt{0.5%tsp} and @black pepper{0.25%tsp}, and rest covered for 2 minutes."
+  },
+  {
+    "title": "Roasted Salmon with Mustard-Dill Cream",
+    "description": "Oven-roasted salmon served with a cool mustard, dill and yoghurt sauce.",
+    "servings": 4,
+    "tags": [
+      "fish",
+      "sauced",
+      "dinner"
+    ],
+    "source_url": null,
+    "notes": "For food safety, cook salmon to 63°C in the thickest part; adjust for local guidance and preference.",
+    "body": "Heat oven to 200°C conventional (180°C fan). Set @salmon fillet{600%g}, skin-side down and divided into 4 portions, on a lined tray; brush with @olive oil{10%ml} and season with @salt{0.75%tsp} and @black pepper{0.25%tsp}. Roast until opaque and 63°C at the thickest point, about 10–15 minutes depending on thickness.\n\nStir @greek yoghurt{150%g}, @dijon mustard{15%g}, @lemon juice{15%ml} and @fresh dill{10%g} together. Taste and adjust seasoning. Serve the salmon with the sauce alongside."
+  },
+  {
+    "title": "Red Lentil and Sweet Potato Curry",
+    "description": "A gently spiced red lentil curry with soft sweet potato and coconut milk.",
+    "servings": 4,
+    "tags": [
+      "curry",
+      "vegan",
+      "stew"
+    ],
+    "source_url": null,
+    "notes": "Add water near the end if the lentils thicken more than desired.",
+    "body": "Warm @neutral oil{15%ml} in a saucepan and soften @onion{1}. Add @garlic clove{3}, @fresh ginger{15%g}, @ground cumin{1%tsp}, @ground coriander{1%tsp} and @ground turmeric{0.5%tsp}; stir for 30 seconds. Add @red lentil{250%g}, rinsed, @sweet potato{400%g}, @crushed tomato{400%g}, @coconut milk{400%ml}, @water{300%ml} and @salt{1%tsp}.\n\nBring to a simmer, cover partially and cook gently, stirring occasionally, until lentils are soft and sweet potato is tender, 20–25 minutes. Thin with water if needed. Stir in @lime juice{15%ml} and adjust seasoning."
+  },
+  {
+    "title": "Apple and Oat Crumble",
+    "description": "Soft cinnamon apples under a crisp topping of oats, flour and butter.",
+    "servings": 6,
+    "tags": [
+      "dessert",
+      "baking",
+      "vegetarian"
+    ],
+    "source_url": null,
+    "notes": "Serve warm. Oven temperatures are suggestions for a home oven.",
+    "body": "Heat oven to 190°C conventional (170°C fan). Toss @apple{800%g}, peeled, cored and sliced, with @lemon juice{15%ml}, half of @granulated sugar{40%g} and @ground cinnamon{1%tsp}; spread in a baking dish.\n\nMix @plain flour{100%g}, @rolled oat{80%g}, @light brown sugar{80%g}, the remaining granulated sugar and @salt{1%pinch}. Rub in @butter{90%g}, cold and diced, until the mixture forms coarse crumbs with some pea-sized pieces. Scatter evenly over the apples. Bake 35–45 minutes until the fruit bubbles at the edges and the top is golden. Rest 10 minutes before serving."
+  }
+]

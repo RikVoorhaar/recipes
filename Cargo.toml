@@ -1,0 +1,28 @@
+[workspace]
+members = ["recipe-app", "recipe-mcp"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+axum = "0.7"
+config = "0.14"
+serde = { version = "1", features = ["derive"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "migrate", "macros"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+sha2 = "0.10"
+subtle = "2"
+uuid = { version = "=1.18.1", features = ["v4"] }
+cooklang = "0.19"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+unicode-casefold = "0.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+typst-as-lib = "=0.14.0"
+typst = "=0.13.0"
+typst-pdf = "=0.13.0"
+typst-layout = "=0.13.0"

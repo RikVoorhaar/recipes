@@ -1,0 +1,23 @@
+[Unit]
+Description=Recipe App
+After=network.target
+
+[Service]
+Type=simple
+User=recipe-app
+Group=recipe-app
+WorkingDirectory=/opt/recipe-app
+Environment=APP_CONFIG_FILE=/etc/recipe-app/config.toml
+EnvironmentFile=/etc/recipe-app/recipe-app.env
+ExecStart=/opt/recipe-app/recipe-app
+Restart=on-failure
+RestartSec=3
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/recipe-app
+
+[Install]
+WantedBy=multi-user.target

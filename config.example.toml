@@ -1,0 +1,4 @@
+bind_addr = "127.0.0.1:3000"
+database_path = "data/recipes.sqlite3"
+content_dir = "data/content"
+api_tokens = []

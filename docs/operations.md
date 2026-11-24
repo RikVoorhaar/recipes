@@ -152,4 +152,4 @@ cargo test -p recipe-app --test ops_restore
 
 Both checks use isolated temporary data and have no production-data, VPS, or
 live-MCP dependency. The separate real local MCP release gate has been run;
-see the [Stage 7 live acceptance evidence](stage7-live-acceptance.md).
+see the [Stage 7 live acceptance evidence](../ai-docs/stage7-live-acceptance.md).

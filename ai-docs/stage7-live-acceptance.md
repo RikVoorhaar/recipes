@@ -143,8 +143,8 @@ It is retained for context only; the agent-owned follow-up above closes that
 evidence gap.
 
 This is the separate local-agent release gate
-from [plan Stage 7](../recipe-app-v1-implementation-plan.md#7-operations-and-release-acceptance)
-and [spec §14](../recipe-app-v1-spec.md#14-testing-and-acceptance-criteria).
+from [plan Stage 7](recipe-app-v1-implementation-plan.md#7-operations-and-release-acceptance)
+and [spec §14](recipe-app-v1-spec.md#14-testing-and-acceptance-criteria).
 It used no production data or deployment.
 
 ## Isolated setup

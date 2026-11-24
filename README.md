@@ -52,4 +52,4 @@ Then prompt:
 
 > Read the writing guidelines and publish a chicken soup recipe using the recipes MCP tools. Do not create or edit local files. Verify it on the public site and give me its URL. If MCP is unavailable, stop and tell me.
 
-See the [v1 specification](recipe-app-v1-spec.md), [implementation plan](recipe-app-v1-implementation-plan.md), [operations guide](docs/operations.md), [OpenAPI spec](openapi.yaml), and [live acceptance evidence](docs/stage7-live-acceptance.md). For local development, run `cp config.example.toml config.toml && cargo run -p recipe-app`; health is at <http://127.0.0.1:3000/health>.
+See the [v1 specification](ai-docs/recipe-app-v1-spec.md), [implementation plan](ai-docs/recipe-app-v1-implementation-plan.md), [cover prompt](ai-docs/recipe-cover-image-prompt.md), [operations guide](docs/operations.md), [OpenAPI spec](openapi.yaml), and [live acceptance evidence](ai-docs/stage7-live-acceptance.md). For local development, run `cp config.example.toml config.toml && cargo run -p recipe-app`; health is at <http://127.0.0.1:3000/health>.

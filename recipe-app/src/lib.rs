@@ -1,6 +1,7 @@
 pub mod config;
 pub mod database;
 mod pdf;
+mod recipe_web;
 pub mod storage;
 
 use axum::{
@@ -653,6 +654,15 @@ fn scaled_view(
     row: &RevisionRow,
     target: u32,
 ) -> Result<ScaledRecipe, ApiError> {
+    scaled_view_with(state, row, target, |_, _, _| ()).map(|(view, ())| view)
+}
+
+fn scaled_view_with<T>(
+    state: &RecipeService,
+    row: &RevisionRow,
+    target: u32,
+    render: impl FnOnce(&cooklang::Recipe, &HashMap<usize, String>, &ScaledRecipe) -> T,
+) -> Result<(ScaledRecipe, T), ApiError> {
     if target == 0 || target > 1000 {
         return Err(ApiError::new(
             "invalid_request",
@@ -712,49 +722,39 @@ fn scaled_view(
         .collect();
     // Cooklang parses a leading declaration block as a step; omit only one
     // verified against standalone source lines.
-    let has_leading_ingredient_declarations = !declaration_notes.is_empty();
-    let instructions = recipe
-        .sections
-        .iter()
-        .flat_map(|section| section.content.iter())
-        .enumerate()
-        .filter_map(|(index, content)| {
-            if index == 0 && has_leading_ingredient_declarations {
-                return None;
-            }
-            Some(match content {
-                cooklang::Content::Step(step) => step
-                    .items
-                    .iter()
-                    .map(|item| match item {
-                        cooklang::Item::Text { value } => InstructionPart::Text(value.clone()),
-                        cooklang::Item::Ingredient { index } => InstructionPart::Ingredient(
-                            recipe.ingredients[*index].display_name().into_owned(),
-                        ),
-                        cooklang::Item::Cookware { index } => {
-                            InstructionPart::Text(recipe.cookware[*index].name.clone())
-                        }
-                        cooklang::Item::Timer { index } => {
-                            let timer = &recipe.timers[*index];
-                            InstructionPart::Text(match (&timer.name, &timer.quantity) {
-                                (Some(name), Some(quantity)) => {
-                                    format!("{name} ({quantity})")
-                                }
-                                (Some(name), None) => name.clone(),
-                                (None, Some(quantity)) => quantity.to_string(),
-                                (None, None) => String::new(),
-                            })
-                        }
-                        cooklang::Item::InlineQuantity { index } => {
-                            InstructionPart::Text(recipe.inline_quantities[*index].to_string())
-                        }
-                    })
-                    .collect(),
-                cooklang::Content::Text(value) => vec![InstructionPart::Text(value.clone())],
-            })
+    let instructions = method_content(&recipe, !declaration_notes.is_empty())
+        .map(|(_, content)| match content {
+            cooklang::Content::Step(step) => step
+                .items
+                .iter()
+                .map(|item| match item {
+                    cooklang::Item::Text { value } => InstructionPart::Text(value.clone()),
+                    cooklang::Item::Ingredient { index } => InstructionPart::Ingredient(
+                        recipe.ingredients[*index].display_name().into_owned(),
+                    ),
+                    cooklang::Item::Cookware { index } => {
+                        InstructionPart::Text(recipe.cookware[*index].name.clone())
+                    }
+                    cooklang::Item::Timer { index } => {
+                        let timer = &recipe.timers[*index];
+                        InstructionPart::Text(match (&timer.name, &timer.quantity) {
+                            (Some(name), Some(quantity)) => {
+                                format!("{name} ({quantity})")
+                            }
+                            (Some(name), None) => name.clone(),
+                            (None, Some(quantity)) => quantity.to_string(),
+                            (None, None) => String::new(),
+                        })
+                    }
+                    cooklang::Item::InlineQuantity { index } => {
+                        InstructionPart::Text(recipe.inline_quantities[*index].to_string())
+                    }
+                })
+                .collect(),
+            cooklang::Content::Text(value) => vec![InstructionPart::Text(value.clone())],
         })
         .collect();
-    Ok(ScaledRecipe {
+    let view = ScaledRecipe {
         id: row.recipe_id.clone(),
         title: row.title.clone(),
         description: row.description.clone(),
@@ -769,7 +769,40 @@ fn scaled_view(
         instructions,
         notes: row.notes.clone(),
         source_url: row.source_url.clone(),
-    })
+    };
+    let extra = render(&recipe, &declaration_notes, &view);
+    Ok((view, extra))
+}
+
+fn method_content(
+    recipe: &cooklang::Recipe,
+    has_declarations: bool,
+) -> impl Iterator<Item = (Option<&str>, &cooklang::Content)> {
+    recipe
+        .sections
+        .iter()
+        .enumerate()
+        .flat_map(move |(section_index, section)| {
+            let mut title = section
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty());
+            section
+                .content
+                .iter()
+                .enumerate()
+                .filter_map(move |(index, content)| {
+                    if has_declarations && section_index == 0 && index == 0 {
+                        return None;
+                    }
+                    let step_title = if matches!(content, cooklang::Content::Step(_)) {
+                        title.take()
+                    } else {
+                        None
+                    };
+                    Some((step_title, content))
+                })
+        })
 }
 
 fn leading_declaration_block(
@@ -1274,10 +1307,14 @@ async fn public_recipe(
         return Err(ApiError::new("not_found", "Recipe not found"));
     }
     let target = query.servings.unwrap_or(row.servings as u32);
-    let view = scaled_view(&state, &row, target)?;
     if is_pdf {
+        let view = scaled_view(&state, &row, target)?;
         return render_pdf_response(&state, view).await;
     }
+    let (view, (ingredients, instructions)) =
+        scaled_view_with(&state, &row, target, |recipe, declarations, view| {
+            recipe_web::render(recipe, declarations, view, state.parser.converter())
+        })?;
     let image = view
         .image
         .as_ref()
@@ -1288,39 +1325,6 @@ async fn public_recipe(
             )
         })
         .unwrap_or_default();
-    let ingredients = view
-        .ingredients
-        .iter()
-        .map(|item| {
-            format!(
-                "<li>{}{}{}</li>",
-                item.quantity
-                    .as_deref()
-                    .map(|quantity| format!("{} ", escape_html(quantity)))
-                    .unwrap_or_default(),
-                highlighted_ingredient(&item.name),
-                item.note
-                    .as_deref()
-                    .filter(|note| !note.is_empty())
-                    .map(|note| format!(" — {}", escape_html(note)))
-                    .unwrap_or_default()
-            )
-        })
-        .collect::<String>();
-    let instructions = view
-        .instructions
-        .iter()
-        .map(|step| {
-            let parts = step
-                .iter()
-                .map(|part| match part {
-                    InstructionPart::Text(text) => escape_html(text),
-                    InstructionPart::Ingredient(name) => highlighted_ingredient(name),
-                })
-                .collect::<String>();
-            format!("<li>{parts}</li>")
-        })
-        .collect::<String>();
     let tags = view
         .tags
         .iter()
@@ -1355,15 +1359,26 @@ async fn public_recipe(
             )
         })
         .unwrap_or_default();
-    let content = format!("<article class=\"recipe-detail\"><header class=\"recipe-heading\"><h1>{}</h1><p class=\"lede\">{}</p><div class=\"tag-list\" aria-label=\"Recipe tags\">{tags}</div></header>{image}<div class=\"recipe-actions\"><form class=\"servings-form\" action=\"/recipes/{}\" method=\"get\"><label for=\"servings\">Servings</label><div class=\"control-row\"><input id=\"servings\" type=\"number\" name=\"servings\" min=\"1\" max=\"1000\" value=\"{}\"><button class=\"button\" type=\"submit\">Update servings</button></div><p class=\"field-hint\">Base recipe serves {}.</p></form><a class=\"button button-secondary\" href=\"/recipes/{}.pdf?servings={}\">Printable PDF</a></div><div class=\"recipe-columns\"><section class=\"recipe-section ingredients-section\"><h2>Ingredients</h2><ul class=\"ingredient-list\">{}</ul></section><section class=\"recipe-section method-section\"><h2>Method</h2><ol class=\"method-list\">{}</ol></section></div>{}{}</article>", escape_html(&view.title), escape_html(&view.description), escape_html(id), target, view.base_servings, escape_html(id), target, ingredients, instructions, notes, source);
+    let method_link = if instructions.is_empty() {
+        ""
+    } else {
+        "<a href=\"#method\">Method</a>"
+    };
+    let method = if instructions.is_empty() {
+        String::new()
+    } else {
+        format!("<section class=\"recipe-section method-section\" aria-labelledby=\"method\"><h2 id=\"method\" tabindex=\"-1\">Method</h2>{instructions}</section>")
+    };
+    let description = if view.description.is_empty() {
+        String::new()
+    } else {
+        format!("<p class=\"lede\">{}</p>", escape_html(&view.description))
+    };
+    let content = format!(
+        "<article class=\"recipe-detail\"><header class=\"recipe-hero\"><div class=\"recipe-heading\"><h1>{}</h1>{description}<p class=\"recipe-yield\">Serves {target}</p><nav class=\"recipe-jumps\" aria-label=\"Recipe sections\"><a href=\"#ingredients\">Ingredients</a>{method_link}</nav></div>{image}</header><div class=\"recipe-actions\"><form class=\"servings-form\" action=\"/recipes/{}#ingredients\" method=\"get\"><label for=\"servings\">Servings</label><div class=\"control-row\"><input id=\"servings\" type=\"number\" name=\"servings\" min=\"1\" max=\"1000\" value=\"{target}\"><button class=\"button\" type=\"submit\">Update servings</button></div></form><a class=\"button button-secondary\" href=\"/recipes/{}.pdf?servings={target}\">Printable PDF</a></div><div class=\"recipe-columns\"><section class=\"recipe-section ingredients-section\" aria-labelledby=\"ingredients\"><h2 id=\"ingredients\" tabindex=\"-1\">Ingredients</h2>{ingredients}</section>{method}</div>{notes}{source}<div class=\"tag-list recipe-tags\" aria-label=\"Recipe tags\">{tags}</div></article>",
+        escape_html(&view.title), escape_html(id), escape_html(id)
+    );
     Ok(public_page(&view.title, &content))
-}
-
-fn highlighted_ingredient(name: &str) -> String {
-    format!(
-        "<span class=\"ingredient-name\">{}</span>",
-        escape_html(name)
-    )
 }
 
 fn public_card(row: &RevisionRow) -> String {

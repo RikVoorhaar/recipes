@@ -16,7 +16,7 @@
 | Should | Design paper at its actual reading size. | Check a physical card on a kitchen counter. Passing a one-page fit test does not mean a cook can read it from the bowl. |
 | Test | Add redundancy selectively. | Try matching phase accents and step links; retain them only if people find the right place more quickly without increasing wrong answers or crowding the card. |
 
-These are design decisions, not nine experimentally proven rules. The sections below separate cooking evidence, accessibility requirements, and proposals to test. For the existing delivery contract, see the repository's [v1 specification](https://github.com/RikVoorhaar/recipes/blob/main/recipe-app-v1-spec.md); this guide does not amend it.
+These are design decisions, not nine experimentally proven rules. The sections below separate cooking evidence, accessibility requirements, and proposals to test. For the existing delivery contract, see the repository's [v1 specification](recipe-app-v1-spec.md); this guide does not amend it.
 
 ## Start with the ingredient-to-step relationship
 
@@ -102,7 +102,7 @@ Build a recipe that works in black ink first. Add a visual signal only when you 
 
 ### Print: distinguish fitting from being legible
 
-The [v1 spec, sections 10–11 and acceptance tests](https://github.com/RikVoorhaar/recipes/blob/main/recipe-app-v1-spec.md) requires one A4 page, starts body text at 11 pt, allows reduction to 8 pt, and rejects overflow rather than adding a page; A5 and duplex are deferred. By contrast, [UKAAF's clear-print guidance](https://www.ukaaf.org/wp-content/uploads/2024/12/G003-UKAAF-Creating-clear-print-and-large-print-documents-v4.pdf) recommends at least 12 pt, ideally 14 pt, for clear print. Those are **different thresholds for different goals**. Do not describe an 8 pt sheet as clear print, and do not silently change v1's page contract.
+The [v1 spec, sections 10–11 and acceptance tests](recipe-app-v1-spec.md) requires one A4 page, starts body text at 11 pt, allows reduction to 8 pt, and rejects overflow rather than adding a page; A5 and duplex are deferred. By contrast, [UKAAF's clear-print guidance](https://www.ukaaf.org/wp-content/uploads/2024/12/G003-UKAAF-Creating-clear-print-and-large-print-documents-v4.pdf) recommends at least 12 pt, ideally 14 pt, for clear print. Those are **different thresholds for different goals**. Do not describe an 8 pt sheet as clear print, and do not silently change v1's page contract.
 
 - **Current A4 output:** Keep the required fit result, but expose the selected type size to the author and flag “fits, but below clear-print target” separately from an overflow error. Cut redundant prose and furniture, simplify references, and adjust spacing or image area before squeezing critical instructions. Never remove a divided amount, a condition or a temperature to save a line.
 - **Future A5 output:** Set a new master at actual A5 size rather than printing the A4 PDF at roughly 71% linear scale: 11 pt would become about 7.8 pt. Start a proof at 12–14 pt body, try one column, and make fit failure an editorial decision. If a recipe cannot fit a single legible face, prefer a concise rewrite, a larger sheet, or an explicitly approved multi-face design; do not silently paginate v1.
@@ -110,7 +110,7 @@ The [v1 spec, sections 10–11 and acceptance tests](https://github.com/RikVoorh
 
 ## Generate the layout from one recipe, not two
 
-The [v1 spec, sections 3–6 and 10–11](https://github.com/RikVoorhaar/recipes/blob/main/recipe-app-v1-spec.md) already puts authored quantities in the Cooklang body, derives ingredient occurrences, and shares scaling and formatting between web and PDF. The following is a proposed renderer contract, not new Cooklang syntax. A markup experiment by Peter Flynn offers a useful precedent for linking ingredient mentions by identity and checking consistency; it was an engineering demonstration, not a cook usability trial ([Flynn, “Cooking up something new”](https://www.balisage.net//Proceedings//vol25/print/Flynn01/BalisageVol25-Flynn01.html)).
+The [v1 spec, sections 3–6 and 10–11](recipe-app-v1-spec.md) already puts authored quantities in the Cooklang body, derives ingredient occurrences, and shares scaling and formatting between web and PDF. The following is a proposed renderer contract, not new Cooklang syntax. A markup experiment by Peter Flynn offers a useful precedent for linking ingredient mentions by identity and checking consistency; it was an engineering demonstration, not a cook usability trial ([Flynn, “Cooking up something new”](https://www.balisage.net//Proceedings//vol25/print/Flynn01/BalisageVol25-Flynn01.html)).
 
 | Derived information | Rule |
 |---|---|

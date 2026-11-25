@@ -181,7 +181,8 @@ async fn ingredient_prologue_does_not_duplicate_rows_or_render_as_a_method_step(
         .await
         .unwrap();
     assert!(html.contains("Heat <span class=\"ingredient-name\">olive oil</span> in a large pot"));
-    assert!(html.contains("<span class=\"ingredient-name\">onion</span> — diced"));
+    assert!(html.contains("<span class=\"gather-note\">diced</span>"));
+    assert!(html.contains("Used in <a href=\"#step-1\" aria-label=\"Step 1\">Step 1</a>"));
     assert!(!html.contains("olive oil onion, diced carrot, sliced"));
 
     let pdf = app
@@ -226,12 +227,50 @@ async fn method_highlights_cooklang_ingredients_but_not_plain_words_or_cookware(
         .text()
         .await
         .unwrap();
-    let salt = "<span class=\"ingredient-name\">salt</span>";
-    assert!(html.contains(&format!("<li>4 g {salt}</li>")));
+    let salt = "<span class=\"ingredient-name\">4 g salt</span>";
+    assert!(html.contains(
+        "<span class=\"gather-name\">salt</span> <span class=\"gather-amount\">4 g</span>"
+    ));
     assert!(html.contains(&format!(
-        "<li>Stir {salt} into the pan, then taste the salt &amp; adjust.</li>"
+        "<p>Stir {salt} into the pan, then taste the salt &amp; adjust.</p>"
     )));
-    assert_eq!(html.matches(salt).count(), 2);
+    assert_eq!(html.matches(salt).count(), 1);
+    assert!(!html.contains("Used in"));
+}
+
+#[tokio::test]
+async fn cooking_view_shows_scaled_allocations_and_links_to_named_steps() {
+    let app = support::TestApp::start().await;
+    let body = "== Toast the crumbs ==\nMelt @butter{20%g}. Add @breadcrumbs{60%g} and toast until crisp.\n\n== Empty the pan ==\nTransfer @&(=1)toasted crumbs{} onto a plate.\n\n== Finish with lemon ==\nMelt @&butter{10%g}. Stir in @lemon zest{2%g}, then toss with the toasted crumbs.";
+    let created: Value = bearer(reqwest::Client::new().post(app.url("/api/v1/recipes")))
+        .json(&json!({"title": "Lemon-butter crumbs", "servings": 2, "body": body}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["recipe"]["id"].as_str().unwrap();
+    let html = app
+        .get(&format!("/recipes/{id}?servings=4"))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains(">Serves 4</p>"));
+    assert!(html.contains(">butter</span> <span class=\"gather-amount\">60 g</span>"));
+    assert_eq!(html.matches("class=\"gather-name\">butter").count(), 1);
+    assert!(html.contains(">40 g butter</span>"));
+    assert!(html.contains(">20 g butter</span>"));
+    assert!(html.contains("href=\"#step-1\" aria-label=\"Step 1: Toast the crumbs\""));
+    assert!(html.contains("href=\"#step-3\" aria-label=\"Step 3: Finish with lemon\""));
+    assert!(!html.contains("href=\"#step-2\""));
+    assert!(html.contains("id=\"step-2\" tabindex=\"-1\""));
+    assert!(html.contains("Transfer toasted crumbs onto a plate."));
+    assert!(!html.contains("class=\"gather-name\">toasted crumbs"));
+    assert!(html.contains("<a href=\"#method\">Method</a>"));
 }
 
 #[tokio::test]

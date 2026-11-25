@@ -86,11 +86,49 @@ paths:
         - { in: path, name: id, required: true, schema: { type: string } }
       requestBody:
         required: true
-        content: { application/json: { schema: { $ref: "#/components/schemas/ExpectedDraftRevision" } } }
+        content: { application/json: { schema: { $ref: "#/components/schemas/PublishDraftBody" } } }
       responses:
         "200": { $ref: "#/components/responses/SaveResult" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v1/drafts/{id}/cover:
+    post:
+      summary: Generate one owner-private draft cover candidate
+      description: Requires the expected draft revision; generates one candidate and never publishes. Returns an opaque ref and the authenticated relative preview route.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GenerateDraftCover" }
+      responses:
+        "201":
+          description: Private candidate reference and authenticated preview path
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [image_ref, preview_url]
+                properties:
+                  image_ref: { type: string }
+                  preview_url: { type: string, pattern: "^/api/v1/drafts/[^/]+/covers/[^/]+$" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/drafts/{id}/covers/{image_ref}:
+    get:
+      summary: Retrieve an owned private draft-cover candidate
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+        - { in: path, name: image_ref, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Generated image bytes; owner authentication required
+          content:
+            image/jpeg: { schema: { type: string, format: binary } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /api/v1/recipes:
     get:
       summary: List current non-deleted recipes
@@ -393,6 +431,22 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/recipes/{id}/cover:
+    post:
+      summary: Generate and attach a cover to the current published recipe
+      description: Requires the current base revision. Existing covers are retained unless replace is explicitly true.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GenerateRecipeCover" }
+      responses:
+        "200": { $ref: "#/components/responses/Recipe" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
   /api/v1/recipes/{id}:
     parameters:
       - { in: path, name: id, required: true, schema: { type: string } }
@@ -543,6 +597,25 @@ components:
       required: [expected_revision]
       properties:
         expected_revision: { type: integer, minimum: 1 }
+    PublishDraftBody:
+      type: object
+      required: [expected_revision]
+      properties:
+        expected_revision: { type: integer, minimum: 1 }
+        image_ref: { type: string, description: Optional selected cover candidate belonging to this draft }
+    GenerateDraftCover:
+      type: object
+      required: [expected_revision, dish_description]
+      properties:
+        expected_revision: { type: integer, minimum: 1 }
+        dish_description: { type: string, description: "Short finished-dish description, at most 500 Unicode characters.", minLength: 1, maxLength: 500 }
+    GenerateRecipeCover:
+      type: object
+      required: [base_revision, dish_description]
+      properties:
+        base_revision: { type: string }
+        dish_description: { type: string, description: "Short finished-dish description, at most 500 Unicode characters.", minLength: 1, maxLength: 500 }
+        replace: { type: boolean, default: false }
     Draft:
       type: object
       required: [id, revision, document, updated_at]

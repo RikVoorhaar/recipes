@@ -14,7 +14,7 @@ async fn health_and_restart_with_an_empty_database() {
         "ok"
     );
     let restarted = fixture.restart().await;
-    assert_eq!(restarted.migration_count().await, 6);
+    assert_eq!(restarted.migration_count().await, 7);
     let response = restarted.get("/health").await;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     assert_eq!(

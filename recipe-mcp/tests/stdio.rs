@@ -1,6 +1,24 @@
-use recipe_app::{app_with_storage, configure_tokens, database, storage::FileImageStorage};
+use axum::{
+    extract::{Path, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Redirect},
+    routing::{get, post},
+    Json, Router,
+};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use recipe_app::{
+    app_with_storage, app_with_storage_and_cover_generator, configure_tokens, cover::Generator,
+    database, storage::FileImageStorage,
+};
 use serde_json::{json, Value};
-use std::{io::Cursor, sync::Arc, time::Duration};
+use std::{
+    io::Cursor,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
@@ -21,6 +39,472 @@ async fn rpc(
         .unwrap();
     input.flush().await.unwrap();
     serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap()
+}
+
+async fn fake_draft_cover(
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_eq!(
+        headers.get(header::AUTHORIZATION).unwrap(),
+        "Bearer fake-token"
+    );
+    assert_eq!(body["expected_revision"], 4);
+    assert_eq!(body["dish_description"], "Roasted squash");
+    if id == "evil-id" {
+        return Json(
+            json!({"image_ref":"opaque-ref","preview_url":"https://example.invalid/image"}),
+        );
+    }
+    assert_eq!(id, "draft-id");
+    Json(
+        json!({"image_ref":"opaque-ref","preview_url":"/api/v1/drafts/draft-id/covers/opaque-ref"}),
+    )
+}
+
+async fn fake_recipe_cover(
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_eq!(
+        headers.get(header::AUTHORIZATION).unwrap(),
+        "Bearer fake-token"
+    );
+    assert_eq!(id, "recipe");
+    assert_eq!(body["base_revision"], "rev-2");
+    assert_eq!(body["replace"], true);
+    Json(json!({"id":"recipe","revision":"rev-3","image":{"ref":"opaque-ref"}}))
+}
+
+async fn fake_preview(
+    headers: HeaderMap,
+) -> (StatusCode, [(header::HeaderName, &'static str); 1], Vec<u8>) {
+    assert_eq!(
+        headers.get(header::AUTHORIZATION).unwrap(),
+        "Bearer fake-token"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/jpeg")],
+        vec![0xff, 0xd8, 0xff, 0xd9],
+    )
+}
+
+async fn counted_cover(
+    State((requests, _location)): State<(Arc<AtomicUsize>, String)>,
+    Path(_id): Path<String>,
+    Json(_body): Json<Value>,
+) -> Json<Value> {
+    requests.fetch_add(1, Ordering::SeqCst);
+    Json(json!({"image_ref":"opaque","preview_url":"/api/v1/drafts/draft/covers/opaque"}))
+}
+
+async fn counted_preview(
+    State((requests, location)): State<(Arc<AtomicUsize>, String)>,
+) -> Redirect {
+    requests.fetch_add(1, Ordering::SeqCst);
+    Redirect::temporary(&location)
+}
+
+async fn redirect_target(
+    State((requests, _location)): State<(Arc<AtomicUsize>, String)>,
+) -> StatusCode {
+    requests.fetch_add(1, Ordering::SeqCst);
+    StatusCode::OK
+}
+
+async fn external_redirect_target(State(requests): State<Arc<AtomicUsize>>) -> StatusCode {
+    requests.fetch_add(1, Ordering::SeqCst);
+    StatusCode::OK
+}
+
+#[tokio::test]
+async fn generate_cover_uses_fake_backend_and_authenticated_relative_preview() {
+    let app = Router::new()
+        .route("/api/v1/drafts/:id/cover", post(fake_draft_cover))
+        .route("/api/v1/drafts/:id/covers/:image_ref", get(fake_preview))
+        .route("/api/v1/recipes/:id/cover", post(fake_recipe_cover));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_recipe-mcp"))
+        .env("RECIPE_API_BASE_URL", format!("http://{address}"))
+        .env("RECIPE_API_TOKEN", "fake-token")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    let catalog = rpc(&mut input, &mut output, 1, "tools/list", json!({})).await;
+    let tool = catalog["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "generate_cover")
+        .unwrap();
+    assert_eq!(tool["inputSchema"]["oneOf"].as_array().unwrap().len(), 2);
+    let draft = rpc(&mut input, &mut output, 2, "tools/call", json!({"name":"generate_cover","arguments":{"draft_id":"draft-id","expected_revision":4,"dish_description":"Roasted squash"}})).await;
+    assert_ne!(draft["result"]["isError"], true, "{draft}");
+    assert_eq!(draft["result"]["content"][0]["type"], "text");
+    assert_eq!(draft["result"]["content"][1]["type"], "image");
+    assert_eq!(draft["result"]["content"][1]["mimeType"], "image/jpeg");
+    let recipe = rpc(&mut input, &mut output, 3, "tools/call", json!({"name":"generate_cover","arguments":{"recipe_id":"recipe","base_revision":"rev-2","replace":true,"dish_description":"Roasted squash"}})).await;
+    assert_ne!(recipe["result"]["isError"], true);
+    assert_eq!(recipe["result"]["content"].as_array().unwrap().len(), 1);
+    let malicious = rpc(&mut input, &mut output, 5, "tools/call", json!({"name":"generate_cover","arguments":{"draft_id":"evil-id","expected_revision":4,"dish_description":"Roasted squash"}})).await;
+    assert_eq!(malicious["result"]["isError"], true);
+    assert!(malicious["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("expected owner-private route"));
+    let invalid = rpc(&mut input, &mut output, 4, "tools/call", json!({"name":"generate_cover","arguments":{"draft_id":"draft","expected_revision":4,"recipe_id":"recipe","base_revision":"rev","dish_description":"dish"}})).await;
+    assert_eq!(invalid["result"]["isError"], true);
+    child.kill().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn malformed_cover_targets_are_rejected_before_any_backend_request() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/api/v1/drafts/:id/cover", post(counted_cover))
+        .with_state((requests.clone(), String::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_recipe-mcp"))
+        .env("RECIPE_API_BASE_URL", format!("http://{address}"))
+        .env("RECIPE_API_TOKEN", "fake-token")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    let bad_arguments = [
+        json!({"draft_id":null,"expected_revision":1,"dish_description":"dish"}),
+        json!({"draft_id":"draft","expected_revision":null,"dish_description":"dish"}),
+        json!({"draft_id":"draft","expected_revision":"1","dish_description":"dish"}),
+        json!({"recipe_id":"recipe","base_revision":null,"dish_description":"dish"}),
+        json!({"recipe_id":"recipe","base_revision":false,"dish_description":"dish"}),
+        json!({"recipe_id":"recipe","base_revision":"rev","replace":null,"dish_description":"dish"}),
+        json!({"recipe_id":"recipe","base_revision":"rev","replace":"yes","dish_description":"dish"}),
+        json!({"draft_id":"draft","expected_revision":1,"base_revision":null,"dish_description":"dish"}),
+        json!({"draft_id":"draft","expected_revision":1,"recipe_id":null,"dish_description":"dish"}),
+        json!({"recipe_id":4,"base_revision":"rev","dish_description":"dish"}),
+        json!({"draft_id":"draft","expected_revision":1,"dish_description":12}),
+        json!({"draft_id":"draft","expected_revision":1,"dish_description":"é".repeat(501)}),
+        json!({"recipe_id":"recipe","base_revision":"rev","expected_revision":null,"dish_description":"dish"}),
+        json!({"draft_id":"draft","expected_revision":1,"dish_description":"dish","model":"not-supported"}),
+        json!({"draft_id":"draft","expected_revision":1,"recipe_id":"recipe","base_revision":"rev","dish_description":"dish"}),
+    ];
+    for (index, arguments) in bad_arguments.into_iter().enumerate() {
+        let result = rpc(
+            &mut input,
+            &mut output,
+            index as u64 + 1,
+            "tools/call",
+            json!({"name":"generate_cover","arguments":arguments}),
+        )
+        .await;
+        assert_eq!(result["result"]["isError"], true, "{arguments}");
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    child.kill().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn preview_redirects_are_not_followed_for_same_or_external_origin() {
+    for external in [false, true] {
+        let target_requests = Arc::new(AtomicUsize::new(0));
+        let (location, target_server) = if external {
+            let target_app = Router::new()
+                .route("/redirect-target", get(external_redirect_target))
+                .with_state(target_requests.clone());
+            let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_address = target_listener.local_addr().unwrap();
+            let target_server =
+                tokio::spawn(
+                    async move { axum::serve(target_listener, target_app).await.unwrap() },
+                );
+            (
+                format!("http://{target_address}/redirect-target"),
+                Some(target_server),
+            )
+        } else {
+            ("/redirect-target".to_string(), None)
+        };
+        let backend_requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/v1/drafts/:id/cover", post(counted_cover))
+            .route("/api/v1/drafts/:id/covers/:image_ref", get(counted_preview))
+            .route("/redirect-target", get(redirect_target))
+            .with_state((backend_requests.clone(), location));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_recipe-mcp"))
+            .env("RECIPE_API_BASE_URL", format!("http://{address}"))
+            .env("RECIPE_API_TOKEN", "fake-token")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        let result = rpc(
+            &mut input,
+            &mut output,
+            1,
+            "tools/call",
+            json!({"name":"generate_cover","arguments":{"draft_id":"draft","expected_revision":1,"dish_description":"dish"}}),
+        )
+        .await;
+        assert_eq!(result["result"]["isError"], true);
+        assert_eq!(backend_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(target_requests.load(Ordering::SeqCst), 0);
+        child.kill().await.unwrap();
+        server.abort();
+        if let Some(target_server) = target_server {
+            target_server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn stdio_cover_generation_publishes_private_candidate_and_survives_failure() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider_calls = calls.clone();
+    let mut png = Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let encoded_image = STANDARD.encode(png.into_inner());
+    let provider = Router::new().route(
+        "/images",
+        post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let calls = provider_calls.clone();
+            let image = encoded_image.clone();
+            async move {
+                assert_eq!(
+                    headers.get(header::AUTHORIZATION).unwrap(),
+                    "Bearer synthetic-test-key"
+                );
+                assert_eq!(body["model"], "stdio-fake-model");
+                assert!(body["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("TEST HOUSE STYLE"));
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                assert!(body["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Dish: Tomato soup."));
+                if call == 1 {
+                    return (StatusCode::BAD_GATEWAY, "synthetic provider failure").into_response();
+                }
+                Json(json!({"data":[{"b64_json":image}]})).into_response()
+            }
+        }),
+    );
+    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_address = provider_listener.local_addr().unwrap();
+    let provider_server =
+        tokio::spawn(async move { axum::serve(provider_listener, provider).await.unwrap() });
+
+    let temp = tempfile::tempdir().unwrap();
+    let pool = database::connect(&temp.path().join("cover-stdio.sqlite"))
+        .await
+        .unwrap();
+    database::migrate(&pool).await.unwrap();
+    configure_tokens(&pool, &["owner:cover-stdio-secret".into()])
+        .await
+        .unwrap();
+    let generator = Generator::with_test_endpoint(
+        "synthetic-test-key".into(),
+        Some("stdio-fake-model".into()),
+        Some("TEST HOUSE STYLE".into()),
+        &format!("http://{provider_address}/images"),
+    )
+    .unwrap();
+    let app = app_with_storage_and_cover_generator(
+        pool,
+        Arc::new(FileImageStorage::new(temp.path().join("cover-images"))),
+        Some(Arc::new(generator)),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_recipe-mcp"))
+        .env("RECIPE_API_BASE_URL", format!("http://{address}"))
+        .env("RECIPE_API_TOKEN", "cover-stdio-secret")
+        // Even if a real provider key is present in the environment, the MCP
+        // process only talks to the local recipe API; provider access is injected.
+        .env("OPENROUTER_API_KEY", "must-not-be-used")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+
+    let created = rpc(
+        &mut input,
+        &mut output,
+        1,
+        "tools/call",
+        json!({"name":"save_draft","arguments":{"document":{
+            "title":"Private tomato soup","servings":2,"body":"Add @tomato{200%g}."
+        }}}),
+    )
+    .await;
+    assert_ne!(created["result"]["isError"], true, "{created}");
+    let draft: Value =
+        serde_json::from_str(created["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let draft_id = draft["id"].as_str().unwrap();
+    let generated = rpc(
+        &mut input,
+        &mut output,
+        2,
+        "tools/call",
+        json!({"name":"generate_cover","arguments":{
+            "draft_id":draft_id,"expected_revision":draft["revision"],
+            "dish_description":"Tomato soup."
+        }}),
+    )
+    .await;
+    assert_ne!(generated["result"]["isError"], true, "{generated}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let generation_content = generated["result"]["content"].as_array().unwrap();
+    let candidate: Value =
+        serde_json::from_str(generation_content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(generation_content[1]["type"], "image");
+    assert_eq!(generation_content[1]["mimeType"], "image/jpeg");
+    let preview_bytes = STANDARD
+        .decode(generation_content[1]["data"].as_str().unwrap())
+        .unwrap();
+    assert!(image::load_from_memory(&preview_bytes).is_ok());
+    let image_ref = candidate["image_ref"].as_str().unwrap();
+    let public_index = reqwest::get(format!("http://{address}/recipes"))
+        .await
+        .unwrap();
+    assert!(!public_index
+        .text()
+        .await
+        .unwrap()
+        .contains("Private tomato soup"));
+    assert_eq!(
+        reqwest::get(format!("http://{address}/images/{image_ref}"))
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let published = rpc(
+        &mut input,
+        &mut output,
+        3,
+        "tools/call",
+        json!({"name":"publish_draft","arguments":{
+            "id":draft_id,"expected_revision":draft["revision"],"image_ref":image_ref
+        }}),
+    )
+    .await;
+    assert_ne!(published["result"]["isError"], true, "{published}");
+    let published: Value =
+        serde_json::from_str(published["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let recipe = &published["recipe"];
+    assert_eq!(recipe["image"]["ref"], image_ref);
+    let public_image = reqwest::get(format!("http://{address}/images/{image_ref}"))
+        .await
+        .unwrap();
+    assert_eq!(public_image.status(), reqwest::StatusCode::OK);
+    assert!(image::load_from_memory(&public_image.bytes().await.unwrap()).is_ok());
+    let consumed = rpc(
+        &mut input,
+        &mut output,
+        4,
+        "tools/call",
+        json!({"name":"get_draft","arguments":{"id":draft_id}}),
+    )
+    .await;
+    assert_eq!(consumed["result"]["isError"], true);
+
+    let failed_draft = rpc(
+        &mut input,
+        &mut output,
+        5,
+        "tools/call",
+        json!({"name":"save_draft","arguments":{"document":{
+            "title":"Cover failure soup","servings":1,"body":"Heat @water{100%ml}."
+        }}}),
+    )
+    .await;
+    let failed_draft: Value = serde_json::from_str(
+        failed_draft["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let failed_id = failed_draft["id"].as_str().unwrap();
+    let failure = rpc(
+        &mut input,
+        &mut output,
+        6,
+        "tools/call",
+        json!({"name":"generate_cover","arguments":{
+            "draft_id":failed_id,"expected_revision":failed_draft["revision"],
+            "dish_description":"Tomato soup."
+        }}),
+    )
+    .await;
+    assert_eq!(failure["result"]["isError"], true);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let intact = rpc(
+        &mut input,
+        &mut output,
+        7,
+        "tools/call",
+        json!({"name":"get_draft","arguments":{"id":failed_id}}),
+    )
+    .await;
+    assert_ne!(intact["result"]["isError"], true);
+    let intact: Value =
+        serde_json::from_str(intact["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(intact["id"], failed_id);
+    let published_without_cover = rpc(
+        &mut input,
+        &mut output,
+        8,
+        "tools/call",
+        json!({"name":"publish_draft","arguments":{
+            "id":failed_id,"expected_revision":failed_draft["revision"]
+        }}),
+    )
+    .await;
+    assert_ne!(
+        published_without_cover["result"]["isError"], true,
+        "{published_without_cover}"
+    );
+    let published_without_cover: Value = serde_json::from_str(
+        published_without_cover["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(published_without_cover["recipe"]["image"].is_null());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    child.kill().await.unwrap();
+    app_server.abort();
+    provider_server.abort();
 }
 
 #[tokio::test]

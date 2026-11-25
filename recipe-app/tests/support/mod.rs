@@ -1,4 +1,9 @@
-use recipe_app::{app_with_storage, database, storage::FileImageStorage};
+use recipe_app::{
+    app_with_storage, app_with_storage_and_cover_generator,
+    cover::Generator,
+    database,
+    storage::{FileImageStorage, ImageStorage},
+};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::{net::SocketAddr, path::PathBuf};
@@ -15,10 +20,44 @@ pub struct TestApp {
 
 impl TestApp {
     pub async fn start() -> Self {
-        Self::launch(TempDir::new().expect("temporary test directory"), None).await
+        Self::launch(
+            TempDir::new().expect("temporary test directory"),
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
-    async fn launch(directory: TempDir, address: Option<SocketAddr>) -> Self {
+    pub async fn start_with_generator(generator: Generator) -> Self {
+        Self::launch(
+            TempDir::new().expect("temporary test directory"),
+            None,
+            Some(Arc::new(generator)),
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_with_generator_and_storage(
+        generator: Generator,
+        storage: Arc<dyn ImageStorage>,
+    ) -> Self {
+        Self::launch(
+            TempDir::new().expect("temporary test directory"),
+            None,
+            Some(Arc::new(generator)),
+            Some(storage),
+        )
+        .await
+    }
+
+    async fn launch(
+        directory: TempDir,
+        address: Option<SocketAddr>,
+        generator: Option<Arc<Generator>>,
+        injected_storage: Option<Arc<dyn ImageStorage>>,
+    ) -> Self {
         let database_path = directory.path().join("test.sqlite3");
         let content_dir = directory.path().join("content");
         tokio::fs::create_dir_all(&content_dir)
@@ -37,11 +76,15 @@ impl TestApp {
             .expect("listener");
         let address = listener.local_addr().expect("local address");
         let app_pool = pool.clone();
-        let storage = Arc::new(FileImageStorage::new(content_dir));
+        let storage =
+            injected_storage.unwrap_or_else(|| Arc::new(FileImageStorage::new(content_dir)));
         let server = tokio::spawn(async move {
-            axum::serve(listener, app_with_storage(app_pool, storage))
-                .await
-                .expect("server");
+            axum::serve(
+                listener,
+                app_with_storage_and_cover_generator(app_pool, storage, generator),
+            )
+            .await
+            .expect("server");
         });
         Self {
             _directory: directory,
@@ -71,6 +114,32 @@ impl TestApp {
             .fetch_one(&self.pool)
             .await
             .expect("migration history")
+    }
+
+    pub async fn fail_candidate_binding_writes(&self) {
+        sqlx::query(
+            "CREATE TRIGGER fail_candidate_binding BEFORE INSERT ON draft_cover_candidates BEGIN SELECT RAISE(FAIL, 'test fault'); END",
+        )
+        .execute(&self.pool)
+        .await
+        .expect("install candidate write fault");
+    }
+
+    pub async fn fail_recipe_revision_writes(&self) {
+        sqlx::query(
+            "CREATE TRIGGER fail_recipe_revision BEFORE INSERT ON recipe_revisions BEGIN SELECT RAISE(FAIL, 'test fault'); END",
+        )
+        .execute(&self.pool)
+        .await
+        .expect("install recipe revision fault");
+    }
+
+    pub async fn image_ref_is_private(&self, reference: &str) -> bool {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM private_image_refs WHERE image_ref=?)")
+            .bind(reference)
+            .fetch_one(&self.pool)
+            .await
+            .expect("private image reference guard")
     }
 
     pub async fn revision_count(&self) -> i64 {

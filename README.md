@@ -53,6 +53,17 @@ back and validate it, and only then call `publish_draft` when publication is
 explicitly requested. Drafts are private to the API token owner and survive
 separate MCP processes.
 
+### Cover generation (server configuration)
+
+Cover generation is server-side and requires `APP__OPENROUTER_API_KEY`. The
+operator can set `APP__COVER_MODEL` (default
+`black-forest-labs/flux-3-image-klein`) and `APP__COVER_PROMPT_FILE` (a Markdown
+file containing the house prompt; when omitted, the built-in prompt matches
+the checked-in house style in `ai-docs/recipe-cover-image-prompt.md`). Set these
+only in the recipe server environment. Never configure the provider key in the
+MCP client. Generation sends only the finished-dish description and house
+prompt to OpenRouter.
+
 Then prompt:
 
 > Read the writing guidelines, draft a chicken soup recipe, read it back and validate it, then explicitly publish it using the recipes MCP tools. Do not create or edit local files. Verify it on the public site and give me its URL. If MCP is unavailable, stop and tell me.

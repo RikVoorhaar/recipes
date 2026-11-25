@@ -1,4 +1,5 @@
 pub mod config;
+pub mod cover;
 pub mod database;
 mod pdf;
 mod recipe_web;
@@ -17,6 +18,7 @@ use axum::{
     Json, Router,
 };
 use cooklang::CooklangParser;
+use cover::Generator;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
@@ -35,14 +37,20 @@ pub(crate) struct RecipeService {
     pool: SqlitePool,
     parser: Arc<CooklangParser>,
     images: Arc<dyn ImageStorage>,
+    cover_generator: Option<Arc<Generator>>,
 }
 
 impl RecipeService {
-    pub(crate) fn new(pool: SqlitePool, images: Arc<dyn ImageStorage>) -> Self {
+    pub(crate) fn new(
+        pool: SqlitePool,
+        images: Arc<dyn ImageStorage>,
+        cover_generator: Option<Arc<Generator>>,
+    ) -> Self {
         Self {
             pool,
             parser: Arc::new(CooklangParser::extended()),
             images,
+            cover_generator,
         }
     }
 
@@ -75,7 +83,15 @@ pub fn app(pool: SqlitePool) -> Router {
 }
 
 pub fn app_with_storage(pool: SqlitePool, images: Arc<dyn ImageStorage>) -> Router {
-    api_router(pool, images)
+    app_with_storage_and_cover_generator(pool, images, None)
+}
+
+pub fn app_with_storage_and_cover_generator(
+    pool: SqlitePool,
+    images: Arc<dyn ImageStorage>,
+    cover_generator: Option<Arc<Generator>>,
+) -> Router {
+    api_router(pool, images, cover_generator)
 }
 
 pub async fn configure_tokens(pool: &SqlitePool, tokens: &[String]) -> Result<(), sqlx::Error> {
@@ -95,8 +111,12 @@ pub async fn configure_tokens(pool: &SqlitePool, tokens: &[String]) -> Result<()
     tx.commit().await
 }
 
-fn api_router(pool: SqlitePool, images: Arc<dyn ImageStorage>) -> Router {
-    let state = RecipeService::new(pool, images);
+fn api_router(
+    pool: SqlitePool,
+    images: Arc<dyn ImageStorage>,
+    cover_generator: Option<Arc<Generator>>,
+) -> Router {
+    let state = RecipeService::new(pool, images, cover_generator);
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/openapi.yaml", get(openapi))
@@ -104,6 +124,8 @@ fn api_router(pool: SqlitePool, images: Arc<dyn ImageStorage>) -> Router {
         .route("/api/v1/drafts", get(list_drafts).post(save_draft))
         .route("/api/v1/drafts/:id", get(get_draft).delete(discard_draft))
         .route("/api/v1/drafts/:id/publish", post(publish_draft))
+        .route("/api/v1/drafts/:id/cover", post(generate_draft_cover))
+        .route("/api/v1/drafts/:id/covers/:image_ref", get(get_draft_cover))
         .route("/api/v1/recipes", get(list_recipes).post(create_recipe))
         .route("/api/v1/recipes/:id/scaled", get(scaled_recipe))
         .route("/api/v1/recipes/:id/pdf", get(api_recipe_pdf))
@@ -122,6 +144,7 @@ fn api_router(pool: SqlitePool, images: Arc<dyn ImageStorage>) -> Router {
             "/api/v1/recipes/:id/image",
             post(attach_image).delete(detach_image),
         )
+        .route("/api/v1/recipes/:id/cover", post(generate_recipe_cover))
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
         .route("/api/v1/tags", get(list_tags))
         .route("/api/v1/ingredients", get(list_ingredients))
@@ -371,6 +394,13 @@ struct DraftWrite {
 #[derive(Deserialize)]
 struct DraftRevision {
     expected_revision: i64,
+    #[serde(default)]
+    image_ref: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExpectedDraftRevision {
+    expected_revision: i64,
 }
 
 #[derive(FromRow)]
@@ -583,10 +613,16 @@ async fn discard_draft(
     State(state): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    request: Result<Json<DraftRevision>, JsonRejection>,
+    request: Result<Json<ExpectedDraftRevision>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let (_, owner_id) = authorize_identity(&state, &headers).await?;
     let Json(revision) = request?;
+    if revision.expected_revision <= 0 {
+        return Err(ApiError::new(
+            "invalid_request",
+            "expected_revision must be positive",
+        ));
+    }
     let result =
         sqlx::query("DELETE FROM recipe_drafts WHERE id=? AND owner_token_hash=? AND revision=?")
             .bind(id)
@@ -612,6 +648,12 @@ async fn publish_draft(
 ) -> Result<(StatusCode, Json<SaveResult>), ApiError> {
     let (author, owner_id) = authorize_identity(&state, &headers).await?;
     let Json(expected) = request?;
+    if expected.expected_revision <= 0 {
+        return Err(ApiError::new(
+            "invalid_request",
+            "expected_revision must be positive",
+        ));
+    }
     let mut tx = state.pool.begin().await.map_err(internal_error)?;
     // Acquire SQLite's write lock before reading so concurrent publishers serialize
     // instead of both opening deferred read transactions and failing lock upgrade.
@@ -668,6 +710,24 @@ async fn publish_draft(
     })?;
     validate_write(&write)?;
     let warnings = state.parse_body(&write.body)?;
+    if let Some(reference) = expected.image_ref.as_deref() {
+        let candidate: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM draft_cover_candidates WHERE image_ref=? AND draft_id=? AND owner_token_hash=? AND draft_revision=?",
+        )
+        .bind(reference)
+        .bind(&id)
+        .bind(&owner_id)
+        .bind(expected.expected_revision)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        if candidate.is_none() || !reference.starts_with("dimg_") {
+            return Err(ApiError::new(
+                "not_found",
+                "Draft cover candidate not found",
+            ));
+        }
+    }
     let (recipe_id, revision_id, image_ref) = if let (Some(recipe), Some(base)) =
         (&row.base_recipe_id, &row.base_revision_id)
     {
@@ -696,7 +756,11 @@ async fn publish_draft(
                 None => ApiError::new("not_found", "Recipe not found"),
             });
         }
-        (recipe.clone(), revision, current.image_ref)
+        (
+            recipe.clone(),
+            revision,
+            expected.image_ref.clone().or(current.image_ref),
+        )
     } else {
         let recipe = new_id("rcp");
         let revision = new_id("rev");
@@ -706,7 +770,7 @@ async fn publish_draft(
             .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
-        (recipe, revision, None)
+        (recipe, revision, expected.image_ref.clone())
     };
     insert_revision(
         &mut tx,
@@ -719,6 +783,13 @@ async fn publish_draft(
         image_ref.as_deref(),
     )
     .await?;
+    if let Some(reference) = expected.image_ref.as_deref() {
+        sqlx::query("DELETE FROM private_image_refs WHERE image_ref=?")
+            .bind(reference)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+    }
     derive_revision(&mut tx, &revision_id, &write.body, &author).await?;
     sqlx::query("DELETE FROM recipe_drafts WHERE id=? AND owner_token_hash=? AND revision=?")
         .bind(&id)
@@ -1406,7 +1477,9 @@ async fn validate_recipe(
     };
     validate_write(&write)?;
     if let Some(image_ref) = request.image_ref.as_deref() {
-        if !state.images.exists(image_ref).map_err(internal_error)? {
+        if !image_ref.starts_with("img_")
+            || !state.images.exists(image_ref).map_err(internal_error)?
+        {
             return Err(ApiError::new("invalid_request", "image_ref does not exist"));
         }
     }
@@ -1862,6 +1935,245 @@ struct UploadedImage {
     url: String,
 }
 
+#[derive(Deserialize)]
+struct GenerateDraftCover {
+    expected_revision: i64,
+    dish_description: String,
+}
+
+#[derive(Serialize)]
+struct DraftCoverCandidate {
+    image_ref: String,
+    preview_url: String,
+}
+
+#[derive(Deserialize)]
+struct GenerateRecipeCover {
+    base_revision: String,
+    dish_description: String,
+    #[serde(default)]
+    replace: bool,
+}
+
+async fn generate_draft_cover(
+    State(state): State<RecipeService>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    request: Result<Json<GenerateDraftCover>, JsonRejection>,
+) -> Result<(StatusCode, Json<DraftCoverCandidate>), ApiError> {
+    let (_, owner) = authorize_identity(&state, &headers).await?;
+    let Json(request) = request?;
+    if request.expected_revision <= 0 {
+        return Err(ApiError::new(
+            "invalid_request",
+            "expected_revision must be positive",
+        ));
+    }
+    let generator = state
+        .cover_generator
+        .as_ref()
+        .ok_or_else(|| ApiError::new("invalid_request", "Cover generation is not configured"))?;
+    let exists: Option<i64> =
+        sqlx::query_scalar("SELECT revision FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
+            .bind(&id)
+            .bind(&owner)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal_error)?;
+    match exists {
+        None => return Err(ApiError::new("not_found", "Draft not found")),
+        Some(revision) if revision != request.expected_revision => {
+            return Err(ApiError::new("conflict", "The draft changed"))
+        }
+        _ => {}
+    }
+    let raw = generator
+        .generate(&request.dish_description)
+        .await
+        .map_err(|message| ApiError::new("cover_generation_failed", message))?;
+    let safe = tokio::task::spawn_blocking(move || normalize_generated_image(raw))
+        .await
+        .map_err(internal_error)?
+        .map_err(|message| ApiError::new("invalid_image", message))?;
+    let reference = new_id("dimg");
+    // Commit the private guard before writing to shared storage. This durable guard
+    // survives either a failed file write or a later candidate-row failure.
+    let mut tx = state.pool.begin().await.map_err(internal_error)?;
+    let locked = sqlx::query("UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?")
+        .bind(&id).bind(&owner).bind(request.expected_revision).execute(&mut *tx).await.map_err(internal_error)?;
+    if locked.rows_affected() == 0 {
+        return Err(ApiError::new(
+            "conflict",
+            "The draft changed during cover generation",
+        ));
+    }
+    sqlx::query("INSERT INTO private_image_refs(image_ref) VALUES(?)")
+        .bind(&reference)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+    state
+        .images
+        .put(&reference, &safe)
+        .map_err(internal_error)?;
+    // Recheck after I/O; a changed/deleted draft leaves only a guarded orphan.
+    let mut tx = state.pool.begin().await.map_err(internal_error)?;
+    let locked = sqlx::query("UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?")
+        .bind(&id).bind(&owner).bind(request.expected_revision).execute(&mut *tx).await.map_err(internal_error)?;
+    if locked.rows_affected() == 0 {
+        return Err(ApiError::new(
+            "conflict",
+            "The draft changed during cover generation",
+        ));
+    }
+    sqlx::query("INSERT INTO draft_cover_candidates(image_ref,draft_id,owner_token_hash,draft_revision,created_at) VALUES(?,?,?,?,?)")
+        .bind(&reference).bind(&id).bind(&owner).bind(request.expected_revision).bind(now())
+        .execute(&mut *tx).await.map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(DraftCoverCandidate {
+            image_ref: reference.clone(),
+            preview_url: format!("/api/v1/drafts/{id}/covers/{reference}"),
+        }),
+    ))
+}
+
+async fn get_draft_cover(
+    State(state): State<RecipeService>,
+    Path((id, reference)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (_, owner) = authorize_identity(&state, &headers).await?;
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT owner_token_hash,draft_revision FROM draft_cover_candidates WHERE image_ref=? AND draft_id=?",
+    ).bind(&reference).bind(&id).fetch_optional(&state.pool).await.map_err(internal_error)?;
+    let Some((candidate_owner, candidate_revision)) = row else {
+        return Err(ApiError::new(
+            "not_found",
+            "Draft cover candidate not found",
+        ));
+    };
+    let current_revision: Option<i64> =
+        sqlx::query_scalar("SELECT revision FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
+            .bind(&id)
+            .bind(&owner)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal_error)?;
+    if candidate_owner != owner || current_revision != Some(candidate_revision) {
+        return Err(ApiError::new(
+            "not_found",
+            "Draft cover candidate not found",
+        ));
+    }
+    private_image_response(&state, &reference)
+}
+
+async fn generate_recipe_cover(
+    State(state): State<RecipeService>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    request: Result<Json<GenerateRecipeCover>, JsonRejection>,
+) -> Result<Json<RecipeDocument>, ApiError> {
+    let author = authorize(&state, &headers).await?;
+    let Json(request) = request?;
+    let generator = state
+        .cover_generator
+        .as_ref()
+        .ok_or_else(|| ApiError::new("invalid_request", "Cover generation is not configured"))?;
+    let current = fetch_revision(&state.pool, &id, &request.base_revision).await?;
+    ensure_current_base(&state.pool, &id, &request.base_revision).await?;
+    if current.image_ref.is_some() && !request.replace {
+        return Err(ApiError::new(
+            "conflict",
+            "Recipe already has a cover; set replace=true to replace it",
+        ));
+    }
+    let raw = generator
+        .generate(&request.dish_description)
+        .await
+        .map_err(|message| ApiError::new("cover_generation_failed", message))?;
+    let safe = tokio::task::spawn_blocking(move || normalize_generated_image(raw))
+        .await
+        .map_err(internal_error)?
+        .map_err(|message| ApiError::new("invalid_image", message))?;
+    let reference = new_id("dimg");
+    sqlx::query("INSERT INTO private_image_refs(image_ref) VALUES(?)")
+        .bind(&reference)
+        .execute(&state.pool)
+        .await
+        .map_err(internal_error)?;
+    state
+        .images
+        .put(&reference, &safe)
+        .map_err(internal_error)?;
+    append_image_revision(
+        &state,
+        &id,
+        &request.base_revision,
+        Some(&reference),
+        &author,
+    )
+    .await
+    .map(Json)
+}
+
+fn private_image_response(state: &RecipeService, reference: &str) -> Result<Response, ApiError> {
+    let bytes = state.images.get(reference).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            ApiError::new("not_found", "Image not found")
+        } else {
+            internal_error(error)
+        }
+    })?;
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("image/jpeg"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
+}
+
+fn normalize_generated_image(bytes: Vec<u8>) -> Result<Vec<u8>, &'static str> {
+    if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+        return Err("Generated image must be non-empty and no larger than 10 MiB");
+    }
+    let mut reader = image::ImageReader::new(io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| "Generated image format is invalid")?;
+    let format = reader.format().ok_or("Generated image format is invalid")?;
+    if !matches!(
+        format,
+        image::ImageFormat::Jpeg | image::ImageFormat::Png | image::ImageFormat::WebP
+    ) {
+        return Err("Generated image format is not supported");
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8_192);
+    limits.max_image_height = Some(8_192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|_| "Generated image is invalid")?;
+    if image.width() as u64 * image.height() as u64 > 16_000_000 {
+        return Err("Generated image exceeds 16 megapixels");
+    }
+    let thumbnail = image.thumbnail(1600, 1600);
+    let mut output = io::Cursor::new(Vec::new());
+    thumbnail
+        .write_to(&mut output, image::ImageFormat::Jpeg)
+        .map_err(|_| "Generated image could not be normalized")?;
+    if output.get_ref().len() > 10 * 1024 * 1024 {
+        return Err("Generated image exceeds size limit");
+    }
+    Ok(output.into_inner())
+}
+
 async fn upload_image(
     State(state): State<RecipeService>,
     headers: HeaderMap,
@@ -1953,8 +2265,26 @@ async fn get_image(
 ) -> Result<impl IntoResponse, ApiError> {
     // Only refs actually issued by this application are accepted. The storage
     // backend validates opaque keys too, and never receives a client path.
-    if !reference.starts_with("img_") {
+    let is_draft_namespace = reference.starts_with("dimg_");
+    if !reference.starts_with("img_") && !is_draft_namespace {
         return Err(ApiError::new("not_found", "Image not found"));
+    }
+    let private_candidate: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM private_image_refs WHERE image_ref=? LIMIT 1")
+            .bind(&reference)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal_error)?;
+    if private_candidate.is_some() || is_draft_namespace {
+        let published: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM recipe_revisions WHERE image_ref=? LIMIT 1")
+                .bind(&reference)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(internal_error)?;
+        if published.is_none() || (is_draft_namespace && private_candidate.is_some()) {
+            return Err(ApiError::new("not_found", "Image not found"));
+        }
     }
     let bytes = state.images.get(&reference).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
@@ -1995,6 +2325,15 @@ async fn attach_image(
             .exists(&request.image_ref)
             .map_err(internal_error)?
     {
+        return Err(ApiError::new("not_found", "Image not found"));
+    }
+    let private_candidate: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM private_image_refs WHERE image_ref=? LIMIT 1")
+            .bind(&request.image_ref)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal_error)?;
+    if private_candidate.is_some() {
         return Err(ApiError::new("not_found", "Image not found"));
     }
     append_image_revision(
@@ -2065,6 +2404,13 @@ async fn append_image_revision(
         image_ref,
     )
     .await?;
+    if image_ref.is_some_and(|reference| reference.starts_with("dimg_")) {
+        sqlx::query("DELETE FROM private_image_refs WHERE image_ref=?")
+            .bind(image_ref)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+    }
     copy_revision_derived(&mut tx, base, &revision_id, &write.body, author).await?;
     tx.commit().await.map_err(internal_error)?;
     Ok(fetch_revision(&state.pool, id, &revision_id)

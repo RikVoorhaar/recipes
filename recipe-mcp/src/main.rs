@@ -25,6 +25,7 @@ impl Api {
         headers.insert(header::AUTHORIZATION, value);
         let client = Client::builder()
             .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| "could not initialize HTTP client".to_string())?;
         Ok(Self {
@@ -59,7 +60,8 @@ fn tools() -> Value {
         ("get_draft", "Read one of your private drafts.", "id"),
         ("list_drafts", "List your private drafts.", ""),
         ("discard_draft", "Discard a draft using its expected_revision.", "id,expected_revision"),
-        ("publish_draft", "Validate and explicitly publish a draft using its expected_revision; publishing consumes it.", "id,expected_revision"),
+        ("publish_draft", "Validate and explicitly publish a draft using its expected_revision; optionally select its generated image_ref. Publishing consumes it.", "id,expected_revision"),
+        ("generate_cover", "By default make one cover attempt for a new dish unless the user opts out. Provide exactly one target: draft_id with expected_revision for a private candidate, or recipe_id with base_revision and optional replace for immediate attachment. Inspect a draft preview before explicitly publishing; if generation fails, report it and proceed without a cover when publication was requested.", ""),
         ("delete_recipe", "Soft-delete a recipe using its current base_revision.", "id,base_revision"),
         ("restore_recipe", "Restore a soft-deleted recipe using its current base_revision.", "id,base_revision"),
         ("list_revisions", "List a recipe's immutable revisions.", "id"),
@@ -110,6 +112,9 @@ fn tool_schema(name: &str, required: &[&str]) -> Value {
         "notes":{"type":["string","null"]},
         "path":{"type":"string"},
         "image_ref":{"type":"string"},
+        "draft_id":{"type":"string"},
+        "dish_description":{"type":"string","description":"Short description of the finished dish."},
+        "replace":{"type":"boolean","default":false},
         "alias":{"type":"string"},
         "name":{"type":"string"},
         "survivor":{"type":"string"}
@@ -158,6 +163,23 @@ fn tool_schema(name: &str, required: &[&str]) -> Value {
             "required":["title","servings","body"],
             "additionalProperties":false
         }),
+        "generate_cover" => json!({
+            "type":"object",
+            "properties":{
+                "draft_id":{"type":"string"},
+                "expected_revision":{"type":"integer","minimum":1},
+                "recipe_id":{"type":"string"},
+                "base_revision":{"type":"string"},
+                "replace":{"type":"boolean","default":false},
+        "dish_description":{"type":"string","description":"Short finished-dish description, at most 500 Unicode characters.","minLength":1,"maxLength":500}
+            },
+            "required":["dish_description"],
+            "oneOf":[
+                {"required":["draft_id","expected_revision"],"not":{"anyOf":[{"required":["recipe_id"]},{"required":["base_revision"]},{"required":["replace"]}]}},
+                {"required":["recipe_id","base_revision"],"not":{"anyOf":[{"required":["draft_id"]},{"required":["expected_revision"]}]}}
+            ],
+            "additionalProperties":false
+        }),
         "list_ingredients" => json!({
             "type":"object",
             "properties":{"q":{"type":"string","description":"Optional canonical ingredient name search."}},
@@ -195,7 +217,13 @@ async fn invoke(api: &Api, name: &str, args: &Value) -> Result<String, String> {
         "publish_draft" => (
             Method::POST,
             format!("/api/v1/drafts/{}/publish", text("id")?),
-            Some(json!({"expected_revision":args["expected_revision"]})),
+            Some({
+                let mut body = json!({"expected_revision":args["expected_revision"]});
+                if let Some(image_ref) = args.get("image_ref") {
+                    body["image_ref"] = image_ref.clone();
+                }
+                body
+            }),
         ),
         "search_recipes" => (
             Method::GET,
@@ -321,6 +349,152 @@ async fn invoke(api: &Api, name: &str, args: &Value) -> Result<String, String> {
         _ => return Err(format!("unknown tool: {name}")),
     };
     api_text(api.request(method, &path, body).await?).await
+}
+
+async fn invoke_generate_cover(api: &Api, args: &Value) -> Result<Vec<Value>, String> {
+    let fields = args
+        .as_object()
+        .ok_or_else(|| "generate_cover arguments must be an object".to_string())?;
+    const ALLOWED_FIELDS: &[&str] = &[
+        "draft_id",
+        "expected_revision",
+        "recipe_id",
+        "base_revision",
+        "replace",
+        "dish_description",
+    ];
+    if let Some(field) = fields
+        .keys()
+        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(format!("unsupported generate_cover argument: {field}"));
+    }
+    let has_draft = fields.contains_key("draft_id");
+    let has_recipe = fields.contains_key("recipe_id");
+    if has_draft == has_recipe {
+        return Err("provide exactly one target: draft_id or recipe_id".into());
+    }
+    let draft = args.get("draft_id").and_then(Value::as_str);
+    let recipe = args.get("recipe_id").and_then(Value::as_str);
+    if (has_draft && draft.is_none()) || (has_recipe && recipe.is_none()) {
+        return Err("target ID must be a string".into());
+    }
+    let description = args
+        .get("dish_description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty() && s.chars().count() <= 500)
+        .ok_or_else(|| {
+            "dish_description must be a non-empty string of at most 500 characters".to_string()
+        })?;
+    let (path, body, draft_id) = match (draft, recipe) {
+        (Some(id), None) => {
+            if id.is_empty() {
+                return Err("target ID must not be empty".into());
+            }
+            let revision = args
+                .get("expected_revision")
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0)
+                .ok_or_else(|| "draft target requires a positive expected_revision".to_string())?;
+            if fields.contains_key("base_revision") || fields.contains_key("replace") {
+                return Err("draft and published recipe targets are mutually exclusive".into());
+            }
+            (
+                format!("/api/v1/drafts/{}/cover", urlencoding(id)),
+                json!({"expected_revision":revision,"dish_description":description}),
+                Some(id),
+            )
+        }
+        (None, Some(id)) => {
+            if id.is_empty() {
+                return Err("target ID must not be empty".into());
+            }
+            if fields.contains_key("expected_revision") {
+                return Err("draft and published recipe targets are mutually exclusive".into());
+            }
+            if fields.contains_key("draft_id") {
+                return Err("draft and published recipe targets are mutually exclusive".into());
+            }
+            let revision = args
+                .get("base_revision")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "published recipe target requires base_revision".to_string())?;
+            let replace = match args.get("replace") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err("replace must be a boolean".into()),
+            };
+            (
+                format!("/api/v1/recipes/{}/cover", urlencoding(id)),
+                json!({"base_revision":revision,"dish_description":description,"replace":replace}),
+                None,
+            )
+        }
+        _ => return Err("provide exactly one target: draft_id or recipe_id".into()),
+    };
+    let response = api.request(Method::POST, &path, Some(body)).await?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "could not read API response".to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {}: cover generation request failed",
+            status.as_u16()
+        ));
+    }
+    let result: Value =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid cover API response".to_string())?;
+    let mut content = vec![json!({"type":"text","text":result.to_string()})];
+    if let Some(id) = draft_id {
+        let image_ref = result
+            .get("image_ref")
+            .and_then(Value::as_str)
+            .ok_or("cover response missing image_ref")?;
+        let expected = format!(
+            "/api/v1/drafts/{}/covers/{}",
+            urlencoding(id),
+            urlencoding(image_ref)
+        );
+        if result.get("preview_url").and_then(Value::as_str) != Some(expected.as_str()) {
+            return Err("cover preview path did not match the expected owner-private route".into());
+        }
+        let mut preview = api.request(Method::GET, &expected, None).await?;
+        if !preview.status().is_success() {
+            return Err("could not retrieve authenticated cover preview".into());
+        }
+        if preview
+            .content_length()
+            .is_some_and(|length| length > 5 * 1024 * 1024)
+        {
+            return Err("cover preview exceeds the 5 MiB MCP limit".into());
+        }
+        let mime = preview
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| v.starts_with("image/"))
+            .ok_or("cover preview was not an image")?
+            .to_owned();
+        let mut image = Vec::new();
+        while let Some(chunk) = preview
+            .chunk()
+            .await
+            .map_err(|_| "could not read cover preview".to_string())?
+        {
+            if image.len() + chunk.len() > 5 * 1024 * 1024 {
+                return Err("cover preview exceeds the 5 MiB MCP limit".into());
+            }
+            image.extend_from_slice(&chunk);
+        }
+        if image.is_empty() {
+            return Err("cover preview is empty or exceeds the 5 MiB MCP limit".into());
+        }
+        content.push(json!({"type":"image","data":base64::Engine::encode(&base64::engine::general_purpose::STANDARD, image),"mimeType":mime}));
+    }
+    Ok(content)
 }
 
 fn search_query_string(value: Option<&Value>) -> Result<String, String> {
@@ -490,7 +664,7 @@ async fn handle(api: &Api, message: Value) -> Value {
         "initialize" => Some(
             json!({"protocolVersion":negotiate_protocol(params.get("protocolVersion")),
             "capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false}},
-            "instructions":"Recipe authoring workflow: call get_guidelines first, save or revise an owner-private draft, read it back with get_draft, validate the candidate, and only then explicitly call publish_draft. Drafts persist across sessions. Do not use HTTP recipe create/update routes for agent authoring.",
+            "instructions":"Recipe authoring workflow: call get_guidelines first, save or revise an owner-private draft, read it back with get_draft, validate the candidate, and only then explicitly call publish_draft. By default make one generate_cover attempt for a new dish unless the user opts out; inspect the private preview before explicitly publishing. If generation fails, report it and publish without a cover when requested. Drafts persist across sessions. Do not use HTTP recipe create/update routes for agent authoring.",
             "serverInfo":{"name":"recipe-mcp","version":"0.1.0"}}),
         ),
         "ping" => Some(json!({})),
@@ -514,6 +688,14 @@ async fn handle(api: &Api, message: Value) -> Value {
         },
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
+            if name == "generate_cover" {
+                return match invoke_generate_cover(api, &params["arguments"]).await {
+                    Ok(content) => json!({"jsonrpc":"2.0","id":id,"result":{"content":content}}),
+                    Err(error) => {
+                        json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":error}],"isError":true}})
+                    }
+                };
+            }
             match invoke(api, name, &params["arguments"]).await {
                 Ok(text) => Some(json!({"content":[{"type":"text","text":text}]})),
                 Err(error) => {

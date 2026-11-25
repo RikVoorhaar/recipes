@@ -1,4 +1,7 @@
-use recipe_app::{app_with_storage, config::Settings, database, storage::FileImageStorage};
+use recipe_app::{
+    app_with_storage_and_cover_generator, config::Settings, cover::Generator, database,
+    storage::FileImageStorage,
+};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -23,6 +26,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     recipe_app::ensure_derived(&pool).await?;
     recipe_app::configure_tokens(&pool, &settings.api_tokens).await?;
+    let cover_generator = match settings.openrouter_api_key {
+        Some(key) if !key.trim().is_empty() => {
+            let prompt = settings
+                .cover_prompt_file
+                .as_ref()
+                .map(std::fs::read_to_string)
+                .transpose()?;
+            Some(Arc::new(Generator::new(
+                key,
+                Some(settings.cover_model),
+                prompt,
+            )?))
+        }
+        _ => None,
+    };
 
     let address: SocketAddr = settings.bind_addr.parse()?;
     let listener = TcpListener::bind(address).await?;
@@ -33,7 +51,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     axum::serve(
         listener,
-        app_with_storage(pool, Arc::new(FileImageStorage::new(settings.content_dir))),
+        app_with_storage_and_cover_generator(
+            pool,
+            Arc::new(FileImageStorage::new(settings.content_dir)),
+            cover_generator,
+        ),
     )
     .await?;
     Ok(())

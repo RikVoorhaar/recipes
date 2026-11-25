@@ -180,8 +180,8 @@ async fn ingredient_prologue_does_not_duplicate_rows_or_render_as_a_method_step(
         .text()
         .await
         .unwrap();
-    assert!(html.contains("Heat olive oil in a large pot"));
-    assert!(html.contains("onion — diced"));
+    assert!(html.contains("Heat <span class=\"ingredient-name\">olive oil</span> in a large pot"));
+    assert!(html.contains("<span class=\"ingredient-name\">onion</span> — diced"));
     assert!(!html.contains("olive oil onion, diced carrot, sliced"));
 
     let pdf = app
@@ -192,10 +192,46 @@ async fn ingredient_prologue_does_not_duplicate_rows_or_render_as_a_method_step(
         .unwrap();
     let document = lopdf::Document::load_mem(&pdf).unwrap();
     assert_eq!(document.get_pages().len(), 1);
-    let pdf_text = pdf_extract::extract_text_from_mem(&pdf).unwrap();
+    let pdf_text = pdf_extract::extract_text_from_mem(&pdf)
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(pdf_text.contains("Heat olive oil in a large pot"));
     assert!(pdf_text.contains("diced"));
     assert!(!pdf_text.contains("olive oil onion, diced carrot, sliced"));
+}
+
+#[tokio::test]
+async fn method_highlights_cooklang_ingredients_but_not_plain_words_or_cookware() {
+    let app = support::TestApp::start().await;
+    let created: Value = bearer(reqwest::Client::new().post(app.url("/api/v1/recipes")))
+        .json(&json!({
+            "title": "Seasoning",
+            "servings": 2,
+            "body": "Stir @salt{2%g} into the #pan{}, then taste the salt & adjust."
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["recipe"]["id"].as_str().unwrap();
+    let html = app
+        .get(&format!("/recipes/{id}?servings=4"))
+        .await
+        .text()
+        .await
+        .unwrap();
+    let salt = "<span class=\"ingredient-name\">salt</span>";
+    assert!(html.contains(&format!("<li>4 g {salt}</li>")));
+    assert!(html.contains(&format!(
+        "<li>Stir {salt} into the pan, then taste the salt &amp; adjust.</li>"
+    )));
+    assert_eq!(html.matches(salt).count(), 2);
 }
 
 #[tokio::test]
@@ -840,12 +876,16 @@ async fn shared_outputs_preserve_timers_tiny_quantities_ranges_notes_tags_and_so
         .bytes()
         .await
         .unwrap();
-    let text = pdf_extract::extract_text_from_mem(&pdf).unwrap();
+    let text = pdf_extract::extract_text_from_mem(&pdf)
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(text.contains("1 hour") || text.contains("1hour"), "{text}");
     for expected in [
         "0.000001 g",
         "1-2 g",
         "0.0004-0.0008 g",
-        "1hour",
         "rest",
         "2 minutes",
         "fine-grained",

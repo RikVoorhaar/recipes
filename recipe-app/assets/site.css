@@ -13,6 +13,8 @@
   --color-accent-dark: #592b1d;
   --color-line: #dfd5c8;
   --color-wash: #eee6da;
+  --color-ingredient: #722f37;
+  --weight-ingredient: 600;
   --font-body: "Lora", Georgia, "Times New Roman", serif;
   --font-ui: system-ui, -apple-system, "Segoe UI", sans-serif;
   --text-small: .875rem;
@@ -112,6 +114,7 @@ input[type="number"] { width: 7rem; }
 .ingredient-list, .method-list { padding-left: 1.4rem; }
 .ingredient-list li, .method-list li { padding-left: .25rem; }
 .ingredient-list li + li { margin-top: .65rem; }
+.ingredient-name { color: var(--color-ingredient); font-weight: var(--weight-ingredient); }
 .method-list li { padding-bottom: 1rem; }
 .notes-section { margin-top: var(--space-5); padding: var(--space-4); border-left: 3px solid var(--color-accent); background: var(--color-surface); }
 .notes-section h2 { margin-bottom: var(--space-2); border: 0; }

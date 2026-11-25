@@ -1,4 +1,4 @@
-use crate::{ScaledIngredient, ScaledRecipe};
+use crate::{InstructionPart, ScaledIngredient, ScaledRecipe};
 use serde::Serialize;
 use std::fmt;
 use typst::{
@@ -42,7 +42,7 @@ struct PdfRecipe<'a> {
     servings: u32,
     has_image: bool,
     ingredients: Vec<PdfIngredient<'a>>,
-    instructions: &'a [String],
+    instructions: &'a [Vec<InstructionPart>],
     notes: &'a str,
     source_url: &'a str,
 }

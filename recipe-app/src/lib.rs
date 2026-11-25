@@ -603,6 +603,36 @@ struct ScaledIngredient {
 }
 
 #[derive(Clone, Serialize)]
+#[serde(tag = "kind", content = "text", rename_all = "snake_case")]
+enum InstructionPart {
+    Text(String),
+    Ingredient(String),
+}
+
+impl InstructionPart {
+    fn text(&self) -> &str {
+        match self {
+            Self::Text(text) | Self::Ingredient(text) => text,
+        }
+    }
+}
+
+fn serialize_instruction_text<S>(
+    steps: &[Vec<InstructionPart>],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    // Keep the public JSON API's array of plain strings.
+    serializer.collect_seq(
+        steps
+            .iter()
+            .map(|step| step.iter().map(InstructionPart::text).collect::<String>()),
+    )
+}
+
+#[derive(Clone, Serialize)]
 struct ScaledRecipe {
     id: String,
     title: String,
@@ -612,7 +642,8 @@ struct ScaledRecipe {
     tags: Vec<String>,
     image: Option<ImageReference>,
     ingredients: Vec<ScaledIngredient>,
-    instructions: Vec<String>,
+    #[serde(serialize_with = "serialize_instruction_text")]
+    instructions: Vec<Vec<InstructionPart>>,
     notes: Option<String>,
     source_url: Option<String>,
 }
@@ -696,28 +727,30 @@ fn scaled_view(
                     .items
                     .iter()
                     .map(|item| match item {
-                        cooklang::Item::Text { value } => value.clone(),
-                        cooklang::Item::Ingredient { index } => {
-                            recipe.ingredients[*index].display_name().into_owned()
+                        cooklang::Item::Text { value } => InstructionPart::Text(value.clone()),
+                        cooklang::Item::Ingredient { index } => InstructionPart::Ingredient(
+                            recipe.ingredients[*index].display_name().into_owned(),
+                        ),
+                        cooklang::Item::Cookware { index } => {
+                            InstructionPart::Text(recipe.cookware[*index].name.clone())
                         }
-                        cooklang::Item::Cookware { index } => recipe.cookware[*index].name.clone(),
                         cooklang::Item::Timer { index } => {
                             let timer = &recipe.timers[*index];
-                            match (&timer.name, &timer.quantity) {
+                            InstructionPart::Text(match (&timer.name, &timer.quantity) {
                                 (Some(name), Some(quantity)) => {
                                     format!("{name} ({quantity})")
                                 }
                                 (Some(name), None) => name.clone(),
                                 (None, Some(quantity)) => quantity.to_string(),
                                 (None, None) => String::new(),
-                            }
+                            })
                         }
                         cooklang::Item::InlineQuantity { index } => {
-                            recipe.inline_quantities[*index].to_string()
+                            InstructionPart::Text(recipe.inline_quantities[*index].to_string())
                         }
                     })
-                    .collect::<String>(),
-                cooklang::Content::Text(value) => value.clone(),
+                    .collect(),
+                cooklang::Content::Text(value) => vec![InstructionPart::Text(value.clone())],
             })
         })
         .collect();
@@ -1260,9 +1293,12 @@ async fn public_recipe(
         .iter()
         .map(|item| {
             format!(
-                "<li>{} {}{}</li>",
-                escape_html(item.quantity.as_deref().unwrap_or("")),
-                escape_html(&item.name),
+                "<li>{}{}{}</li>",
+                item.quantity
+                    .as_deref()
+                    .map(|quantity| format!("{} ", escape_html(quantity)))
+                    .unwrap_or_default(),
+                highlighted_ingredient(&item.name),
                 item.note
                     .as_deref()
                     .filter(|note| !note.is_empty())
@@ -1274,7 +1310,16 @@ async fn public_recipe(
     let instructions = view
         .instructions
         .iter()
-        .map(|step| format!("<li>{}</li>", escape_html(step)))
+        .map(|step| {
+            let parts = step
+                .iter()
+                .map(|part| match part {
+                    InstructionPart::Text(text) => escape_html(text),
+                    InstructionPart::Ingredient(name) => highlighted_ingredient(name),
+                })
+                .collect::<String>();
+            format!("<li>{parts}</li>")
+        })
         .collect::<String>();
     let tags = view
         .tags
@@ -1312,6 +1357,13 @@ async fn public_recipe(
         .unwrap_or_default();
     let content = format!("<article class=\"recipe-detail\"><header class=\"recipe-heading\"><h1>{}</h1><p class=\"lede\">{}</p><div class=\"tag-list\" aria-label=\"Recipe tags\">{tags}</div></header>{image}<div class=\"recipe-actions\"><form class=\"servings-form\" action=\"/recipes/{}\" method=\"get\"><label for=\"servings\">Servings</label><div class=\"control-row\"><input id=\"servings\" type=\"number\" name=\"servings\" min=\"1\" max=\"1000\" value=\"{}\"><button class=\"button\" type=\"submit\">Update servings</button></div><p class=\"field-hint\">Base recipe serves {}.</p></form><a class=\"button button-secondary\" href=\"/recipes/{}.pdf?servings={}\">Printable PDF</a></div><div class=\"recipe-columns\"><section class=\"recipe-section ingredients-section\"><h2>Ingredients</h2><ul class=\"ingredient-list\">{}</ul></section><section class=\"recipe-section method-section\"><h2>Method</h2><ol class=\"method-list\">{}</ol></section></div>{}{}</article>", escape_html(&view.title), escape_html(&view.description), escape_html(id), target, view.base_servings, escape_html(id), target, ingredients, instructions, notes, source);
     Ok(public_page(&view.title, &content))
+}
+
+fn highlighted_ingredient(name: &str) -> String {
+    format!(
+        "<span class=\"ingredient-name\">{}</span>",
+        escape_html(name)
+    )
 }
 
 fn public_card(row: &RevisionRow) -> String {

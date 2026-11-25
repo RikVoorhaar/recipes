@@ -1,8 +1,9 @@
 # Recipe-writing guidelines
 
-- Use metric quantities with explicit units. Author quantities only in Cooklang.
+- Use metric quantities and put them only in Cooklang. Prefer weight in grams whenever it is practical, especially for salt, spices, and other dry ingredients. Specify measured salt in grams, never in teaspoons or tablespoons.
+- When volume is appropriate, use milliliters (`ml`), not teaspoons or tablespoons. For larger amounts of water, milliliters or liters (`l`) are both fine. Use counts where they are natural, such as two eggs.
 - Give the recipe a clear base serving count or yield in structured metadata.
-- Mark every ingredient with Cooklang syntax wherever it is used; the ingredient list is derived from the body.
+- Mark ingredients with Cooklang syntax when they appear in the method so readers can spot them quickly. The ingredient list is derived from the body; do not repeat a quantity just to mark a later mention.
 - Prefer canonical ingredient names. Search the ingredient list first; use explicit aliases rather than inventing near-duplicates.
 - Include temperatures whenever a useful measurement exists: oven temperature and fan/conventional mode; core temperature for meat, fish, baked goods and custards; surface temperature for pans, woks and griddles when it matters; and temperature plus hold time for liquids or starches where relevant. Say what and where to measure (for example, thickest part or pan surface).
 - Be concise for an experienced cook. Keep special techniques and surprising steps; omit mundane steps. Everyday dishes may be an ingredient list with one or two key notes.

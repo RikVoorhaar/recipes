@@ -4,6 +4,7 @@
 #let font-size = inputs.font-size
 #let image-height = if font-size >= 10 { 48mm } else { 36mm }
 #let tightness = if font-size >= 10 { 1 } else { 0.82 }
+#let ingredient-name(name) = text(weight: "semibold", fill: rgb("#722f37"), name)
 
 #set page(paper: "a4", margin: (x: 13mm, y: 12mm))
 #set text(font: "Lora", size: font-size * 1pt, lang: "en", fill: rgb("#25251f"))
@@ -35,7 +36,7 @@
       - #if ingredient.quantity != "" [
           #text(weight: "bold", ingredient.quantity + " ")
         ]
-        #ingredient.name
+        #ingredient-name(ingredient.name)
         #if ingredient.note != "" [
           #text(fill: rgb("#62635c"), " (" + ingredient.note + ")")
         ]
@@ -45,7 +46,11 @@
     #text(size: font-size * 1.12pt, weight: "bold", "Method")
     #v(1.5mm)
     #for step in recipe.instructions [
-      + #step
+      + #step.map(part => if part.kind == "ingredient" {
+          ingredient-name(part.text)
+        } else {
+          text(part.text)
+        }).join()
     ]
   ],
 )

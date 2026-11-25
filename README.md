@@ -48,8 +48,13 @@ OpenCode's [file substitution](https://opencode.ai/docs/config#variables) reads 
 
 Config reloads automatically; if needed run `/reload`. In that session, use `/mcps` and confirm `recipes` connects, then call `recipes_get_guidelines` through MCP. If MCP or the call is unavailable, stop and ask—do not create a file or bypass MCP.
 
+Through MCP, first read `get_guidelines`, save the recipe as a draft, read it
+back and validate it, and only then call `publish_draft` when publication is
+explicitly requested. Drafts are private to the API token owner and survive
+separate MCP processes.
+
 Then prompt:
 
-> Read the writing guidelines and publish a chicken soup recipe using the recipes MCP tools. Do not create or edit local files. Verify it on the public site and give me its URL. If MCP is unavailable, stop and tell me.
+> Read the writing guidelines, draft a chicken soup recipe, read it back and validate it, then explicitly publish it using the recipes MCP tools. Do not create or edit local files. Verify it on the public site and give me its URL. If MCP is unavailable, stop and tell me.
 
 See the [v1 specification](ai-docs/recipe-app-v1-spec.md), [implementation plan](ai-docs/recipe-app-v1-implementation-plan.md), [cover prompt](ai-docs/recipe-cover-image-prompt.md), [operations guide](docs/operations.md), [OpenAPI spec](openapi.yaml), and [live acceptance evidence](ai-docs/stage7-live-acceptance.md). For local development, run `cp config.example.toml config.toml && cargo run -p recipe-app`; health is at <http://127.0.0.1:3000/health>.

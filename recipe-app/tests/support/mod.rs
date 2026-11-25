@@ -94,6 +94,18 @@ impl TestApp {
             .expect("stored token digest")
     }
 
+    pub async fn configure_second_token(&self) {
+        recipe_app::configure_tokens(
+            &self.pool,
+            &[
+                "integration:test-secret".into(),
+                "integration:other-secret".into(),
+            ],
+        )
+        .await
+        .expect("configure second test token");
+    }
+
     pub async fn rebuild_derived(&self) {
         recipe_app::rebuild_derived(&self.pool)
             .await

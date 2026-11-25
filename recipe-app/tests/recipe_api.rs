@@ -26,6 +26,516 @@ async fn create(app: &support::TestApp) -> Value {
 }
 
 #[tokio::test]
+async fn drafts_are_private_inert_revision_checked_and_publish_atomically() {
+    let app = support::TestApp::start().await;
+    app.configure_second_token().await;
+    let create = |document: Value| {
+        bearer(reqwest::Client::new().post(app.url("/api/v1/drafts")))
+            .json(&json!({"document":document}))
+    };
+    let draft_response = create(json!({"title":"Private partial"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(draft_response.status(), 201);
+    let draft: Value = draft_response.json().await.unwrap();
+    let id = draft["id"].as_str().unwrap();
+    assert_eq!(draft["revision"], 1);
+    assert!(!app
+        .get("/")
+        .await
+        .text()
+        .await
+        .unwrap()
+        .contains("Private partial"));
+    let other_list: Value = reqwest::Client::new()
+        .get(app.url("/api/v1/drafts"))
+        .bearer_auth("other-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(other_list.as_array().unwrap().is_empty());
+    let public_recipes: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/recipes")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(public_recipes.as_array().unwrap().is_empty());
+    assert_eq!(app.revision_count().await, 0);
+    assert_eq!(app.ingredient_count().await, 0);
+    let tags: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/tags")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(tags.as_array().unwrap().is_empty());
+    assert!(!app
+        .get("/ingredients")
+        .await
+        .text()
+        .await
+        .unwrap()
+        .contains("Private partial"));
+
+    let other = reqwest::Client::new()
+        .get(app.url(&format!("/api/v1/drafts/{id}")))
+        .bearer_auth("other-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 404);
+    let listed: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/drafts")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    for method in ["save", "discard", "publish"] {
+        let request = match method {
+            "save" => reqwest::Client::new()
+                .post(app.url("/api/v1/drafts"))
+                .json(&json!({"id":id,"expected_revision":1,"document":{"title":"stolen"}})),
+            "discard" => reqwest::Client::new()
+                .delete(app.url(&format!("/api/v1/drafts/{id}")))
+                .json(&json!({"expected_revision":1})),
+            _ => reqwest::Client::new()
+                .post(app.url(&format!("/api/v1/drafts/{id}/publish")))
+                .json(&json!({"expected_revision":1})),
+        }
+        .bearer_auth("other-secret");
+        let response = request.send().await.unwrap();
+        assert!(
+            response.status() == 404 || response.status() == 409,
+            "other owner {method} returned {}",
+            response.status()
+        );
+    }
+
+    let update = bearer(reqwest::Client::new().post(app.url("/api/v1/drafts")))
+        .json(&json!({"id":id,"expected_revision":1,"document":{"title":"Draft noodles","servings":2,"body":"~rest{}","tags":["private"]}}))
+        .send().await.unwrap();
+    assert_eq!(update.status(), 200);
+    let draft: Value = update.json().await.unwrap();
+    let revision = draft["revision"].as_i64().unwrap();
+    let stale_save = bearer(reqwest::Client::new().post(app.url("/api/v1/drafts")))
+        .json(&json!({"id":id,"expected_revision":1,"document":{"title":"Overwritten"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_save.status(), 409);
+    let invalid =
+        bearer(reqwest::Client::new().post(app.url(&format!("/api/v1/drafts/{id}/publish"))))
+            .json(&json!({"expected_revision":revision}))
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(invalid.status(), 422);
+    let retained: Value =
+        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/drafts/{id}"))))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(retained["revision"], revision);
+
+    let fixed = bearer(reqwest::Client::new().post(app.url("/api/v1/drafts")))
+        .json(&json!({"id":id,"expected_revision":revision,"document":{"body":"Add @tomato{100%g}."}}))
+        .send().await.unwrap().json::<Value>().await.unwrap();
+    let private_search: Value = bearer(
+        reqwest::Client::new().get(app.url("/api/v1/search?q=Draft%20noodles&ingredients=tomato")),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(private_search.as_array().unwrap().is_empty());
+    let private_ingredient: Value =
+        bearer(reqwest::Client::new().get(app.url("/api/v1/ingredients?q=tomato")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert!(private_ingredient.as_array().unwrap().is_empty());
+    assert!(!app
+        .get("/ingredients")
+        .await
+        .text()
+        .await
+        .unwrap()
+        .contains("tomato"));
+    let publish = || {
+        bearer(reqwest::Client::new().post(app.url(&format!("/api/v1/drafts/{id}/publish"))))
+            .json(&json!({"expected_revision":fixed["revision"]}))
+    };
+    let (left, right) = tokio::join!(publish().send(), publish().send());
+    let statuses = [
+        left.unwrap().status().as_u16(),
+        right.unwrap().status().as_u16(),
+    ];
+    assert_eq!(statuses.iter().filter(|s| **s == 200).count(), 1);
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 404 || **s == 409).count(),
+        1,
+        "publish statuses: {statuses:?}"
+    );
+    let published: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/recipes")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(published.as_array().unwrap().len(), 1);
+    assert_eq!(published[0]["title"], "Draft noodles");
+    assert_eq!(app.revision_count().await, 1);
+    assert_eq!(
+        app.get("/")
+            .await
+            .text()
+            .await
+            .unwrap()
+            .matches("Draft noodles")
+            .count(),
+        1
+    );
+    let discarded = create(json!({"title":"discard"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert!(discarded["id"].is_string(), "discard draft: {discarded}");
+    assert_eq!(discarded["revision"], 1);
+    let discarded_id = discarded["id"].as_str().unwrap();
+    let check =
+        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/drafts/{discarded_id}"))))
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(check.status(), 200);
+    let response =
+        bearer(reqwest::Client::new().delete(app.url(&format!("/api/v1/drafts/{discarded_id}"))))
+            .json(&json!({"expected_revision":discarded["revision"]}))
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(response.status(), 204, "{}", response.text().await.unwrap());
+
+    let recipe_id = published[0]["id"].as_str().unwrap();
+    let base_revision = published[0]["revision"].as_str().unwrap();
+    let edit = bearer(reqwest::Client::new().post(app.url("/api/v1/drafts")))
+        .json(&json!({"recipe_id":recipe_id,"document":{"title":"Stale draft edit"}}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let newer =
+        bearer(reqwest::Client::new().put(app.url(&format!("/api/v1/recipes/{recipe_id}"))))
+            .json(&json!({
+                "title":"Newer published edit","servings":2,"body":"@tomato{200%g}",
+                "base_revision":base_revision
+            }))
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(newer.status(), 200);
+    let newer: Value = newer.json().await.unwrap();
+    let stale_publish = bearer(reqwest::Client::new().post(app.url(&format!(
+        "/api/v1/drafts/{}/publish",
+        edit["id"].as_str().unwrap()
+    ))))
+    .json(&json!({"expected_revision":edit["revision"]}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stale_publish.status(), 409);
+    let retained: Value = bearer(
+        reqwest::Client::new()
+            .get(app.url(&format!("/api/v1/drafts/{}", edit["id"].as_str().unwrap()))),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(retained["revision"], edit["revision"]);
+    let history: Value = bearer(
+        reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{recipe_id}/revisions"))),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(history.as_array().unwrap().len(), 2);
+    assert_eq!(newer["recipe"]["id"], recipe_id);
+    assert_eq!(newer["recipe"]["title"], "Newer published edit");
+}
+
+#[tokio::test]
+async fn publishing_an_edit_draft_preserves_recipe_identity_cover_and_history() {
+    let app = support::TestApp::start().await;
+    let initial = create(&app).await["recipe"].clone();
+    let recipe_id = initial["id"].as_str().unwrap();
+    let first_revision = initial["revision"].as_str().unwrap();
+    let mut png = Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(12, 12, image::Rgb([120, 80, 40]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let uploaded: Value = bearer(
+        reqwest::Client::new()
+            .post(app.url("/api/v1/images"))
+            .header("content-type", "image/png")
+            .body(png.into_inner()),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let attached: Value =
+        bearer(reqwest::Client::new().post(app.url(&format!("/api/v1/recipes/{recipe_id}/image"))))
+            .json(&json!({"base_revision":first_revision,"image_ref":uploaded["ref"]}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let attached_revision = attached["revision"].as_str().unwrap();
+
+    let draft: Value = bearer(reqwest::Client::new().post(app.url("/api/v1/drafts")))
+        .json(&json!({
+            "recipe_id":recipe_id,
+            "document":{"title":"Drafted edit","description":"Text-only change","servings":3}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let saved: Value = bearer(reqwest::Client::new().post(app.url("/api/v1/drafts")))
+        .json(&json!({
+            "id":draft["id"],"expected_revision":draft["revision"],
+            "document":{"body":"Add @butter{30%g} and @pasta{300%g}."}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let published: Value = bearer(reqwest::Client::new().post(app.url(&format!(
+        "/api/v1/drafts/{}/publish",
+        draft["id"].as_str().unwrap()
+    ))))
+    .json(&json!({"expected_revision":saved["revision"]}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+
+    let result = &published["recipe"];
+    assert_eq!(result["id"], recipe_id);
+    assert_eq!(result["title"], "Drafted edit");
+    assert_eq!(result["image"]["ref"], uploaded["ref"]);
+    assert_ne!(result["revision"], attached_revision);
+    let history: Value = bearer(
+        reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{recipe_id}/revisions"))),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(history.as_array().unwrap().len(), 3);
+    let revisions: Vec<&str> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|revision| revision["revision"].as_str().unwrap())
+        .collect();
+    assert!(revisions.contains(&first_revision));
+    assert!(revisions.contains(&attached_revision));
+    assert!(revisions.contains(&result["revision"].as_str().unwrap()));
+    let prior: Value = bearer(reqwest::Client::new().get(app.url(&format!(
+        "/api/v1/recipes/{recipe_id}/revisions/{attached_revision}"
+    ))))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(prior["image"]["ref"], uploaded["ref"]);
+    assert_eq!(prior["title"], "Butter noodles");
+}
+
+#[tokio::test]
+async fn edit_draft_publishes_over_pool_capacity_without_internal_errors() {
+    let app = support::TestApp::start().await;
+    const RECIPE_COUNT: usize = 12;
+    let client = reqwest::Client::new();
+    let mut publish_requests = Vec::new();
+    for index in 0..RECIPE_COUNT {
+        let created: Value = bearer(client.post(app.url("/api/v1/recipes")))
+            .json(&json!({
+                "title":format!("Contention recipe {index}"),
+                "servings":2,
+                "body":"Add @rice{100%g}."
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let recipe_id = created["recipe"]["id"].as_str().unwrap();
+        let draft: Value = bearer(client.post(app.url("/api/v1/drafts")))
+            .json(&json!({
+                "recipe_id":recipe_id,
+                "document":{"title":format!("Contention edit {index}")}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        publish_requests.push((
+            draft["id"].as_str().unwrap().to_owned(),
+            draft["revision"].as_i64().unwrap(),
+        ));
+    }
+    // SQLx's default SQLite pool capacity is 10; these independent transactions
+    // contend concurrently while each publishes an edit on a distinct recipe.
+    let mut tasks = tokio::task::JoinSet::new();
+    for (id, revision) in &publish_requests {
+        let client = client.clone();
+        let url = app.url(&format!("/api/v1/drafts/{id}/publish"));
+        let revision = *revision;
+        tasks.spawn(async move {
+            bearer(client.post(url))
+                .json(&json!({"expected_revision":revision}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+    }
+    let (duplicate_id, duplicate_revision) = &publish_requests[0];
+    for _ in 0..2 {
+        let client = client.clone();
+        let url = app.url(&format!("/api/v1/drafts/{duplicate_id}/publish"));
+        let revision = *duplicate_revision;
+        tasks.spawn(async move {
+            bearer(client.post(url))
+                .json(&json!({"expected_revision":revision}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+    }
+    let mut statuses = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        statuses.push(result.unwrap());
+    }
+    assert_eq!(
+        statuses.iter().filter(|status| **status == 200).count(),
+        RECIPE_COUNT
+    );
+    assert_eq!(statuses.iter().filter(|status| **status == 409).count(), 2);
+    assert!(
+        statuses.iter().all(|status| *status != 500),
+        "unexpected publish response codes: {statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn simultaneous_edit_draft_starts_over_pool_capacity_do_not_exhaust_connections() {
+    let app = support::TestApp::start().await;
+    let created = create(&app).await;
+    let recipe_id = created["recipe"]["id"].as_str().unwrap().to_owned();
+    let base_revision = created["recipe"]["revision"].as_str().unwrap().to_owned();
+    let client = reqwest::Client::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    // SQLx's default SQLite pool is 10 connections. Each request starts from the
+    // same published revision but must persist an independent owner-private draft.
+    for index in 0..12 {
+        let client = client.clone();
+        let url = app.url("/api/v1/drafts");
+        let recipe_id = recipe_id.clone();
+        tasks.spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                bearer(client.post(url))
+                    .json(&json!({
+                        "recipe_id":recipe_id,
+                        "document":{"title":format!("Concurrent edit draft {index}")}
+                    }))
+                    .send(),
+            )
+            .await
+            .expect("draft start must not wait for a nested pool connection")
+            .unwrap()
+        });
+    }
+    let mut draft_ids = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        let response = result.unwrap();
+        assert_eq!(
+            response.status(),
+            201,
+            "edit-draft start must succeed without internal errors: {}",
+            response.text().await.unwrap_or_default()
+        );
+        let draft: Value = response.json().await.unwrap();
+        assert_eq!(draft["base_recipe_id"], recipe_id);
+        assert_eq!(draft["base_revision"], base_revision);
+        draft_ids.push(draft["id"].as_str().unwrap().to_owned());
+    }
+    draft_ids.sort();
+    draft_ids.dedup();
+    assert_eq!(draft_ids.len(), 12);
+    let listed: Value = bearer(client.get(app.url("/api/v1/drafts")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 12);
+}
+
+#[tokio::test]
 async fn public_pages_scaled_view_and_validation_are_read_only() {
     let app = support::TestApp::start().await;
     let created = create(&app).await;

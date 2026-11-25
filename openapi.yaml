@@ -44,6 +44,53 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalError"
+  /api/v1/drafts:
+    get:
+      summary: List private drafts owned by the bearer token
+      responses:
+        "200": { description: Owned drafts, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Draft" } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      summary: Create or revise an owner-private draft
+      description: Existing drafts require expected_revision. Incomplete document objects are accepted. Set recipe_id to start from the current published recipe.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DraftWrite" }
+      responses:
+        "200": { description: Revised draft, content: { application/json: { schema: { $ref: "#/components/schemas/Draft" } } } }
+        "201": { description: New draft, content: { application/json: { schema: { $ref: "#/components/schemas/Draft" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/drafts/{id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: string } }
+    get:
+      summary: Read an owned private draft
+      responses:
+        "200": { description: Draft, content: { application/json: { schema: { $ref: "#/components/schemas/Draft" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Discard an owned draft with revision check
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ExpectedDraftRevision" } } }
+      responses:
+        "204": { description: Discarded }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/drafts/{id}/publish:
+    post:
+      summary: Validate and atomically publish a draft
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ExpectedDraftRevision" } } }
+      responses:
+        "200": { $ref: "#/components/responses/SaveResult" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationError" }
   /api/v1/recipes:
     get:
       summary: List current non-deleted recipes
@@ -483,6 +530,29 @@ components:
       type: http
       scheme: bearer
   schemas:
+    DraftWrite:
+      type: object
+      required: [document]
+      properties:
+        id: { type: string }
+        expected_revision: { type: integer, minimum: 1 }
+        recipe_id: { type: string, description: Start an edit from this recipe's current revision }
+        document: { type: object, additionalProperties: true }
+    ExpectedDraftRevision:
+      type: object
+      required: [expected_revision]
+      properties:
+        expected_revision: { type: integer, minimum: 1 }
+    Draft:
+      type: object
+      required: [id, revision, document, updated_at]
+      properties:
+        id: { type: string }
+        revision: { type: integer }
+        base_recipe_id: { type: [string, "null"] }
+        base_revision: { type: [string, "null"] }
+        document: { type: object, additionalProperties: true }
+        updated_at: { type: string, format: date-time }
     NameBody:
       type: object
       required: [name]

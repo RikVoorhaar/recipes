@@ -24,6 +24,87 @@ async fn rpc(
 }
 
 #[tokio::test]
+async fn private_draft_resumes_in_a_new_stdio_process_and_publishes_explicitly() {
+    let temp = tempfile::tempdir().unwrap();
+    let pool = database::connect(&temp.path().join("resume.sqlite"))
+        .await
+        .unwrap();
+    database::migrate(&pool).await.unwrap();
+    configure_tokens(&pool, &["owner:resume-secret".into()])
+        .await
+        .unwrap();
+    let app = app_with_storage(
+        pool,
+        Arc::new(FileImageStorage::new(temp.path().join("images"))),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let spawn = || {
+        Command::new(env!("CARGO_BIN_EXE_recipe-mcp"))
+            .env("RECIPE_API_BASE_URL", format!("http://{address}"))
+            .env("RECIPE_API_TOKEN", "resume-secret")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let mut first = spawn();
+    let mut first_in = first.stdin.take().unwrap();
+    let mut first_out = BufReader::new(first.stdout.take().unwrap()).lines();
+    let draft = rpc(
+        &mut first_in,
+        &mut first_out,
+        1,
+        "tools/call",
+        json!({"name":"save_draft","arguments":{"document":{"title":"Resumable soup"}}}),
+    )
+    .await;
+    let draft: Value =
+        serde_json::from_str(draft["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    first.kill().await.unwrap();
+
+    let mut second = spawn();
+    let mut input = second.stdin.take().unwrap();
+    let mut output = BufReader::new(second.stdout.take().unwrap()).lines();
+    let read = rpc(
+        &mut input,
+        &mut output,
+        2,
+        "tools/call",
+        json!({"name":"get_draft","arguments":{"id":draft["id"]}}),
+    )
+    .await;
+    let resumed: Value =
+        serde_json::from_str(read["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(resumed["document"]["title"], "Resumable soup");
+    let saved = rpc(&mut input,&mut output,3,"tools/call",json!({"name":"save_draft","arguments":{"id":draft["id"],"expected_revision":1,"document":{"servings":2,"body":"Simmer @tomato{100%g}."}}})).await;
+    let saved: Value =
+        serde_json::from_str(saved["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let validation = rpc(
+        &mut input,
+        &mut output,
+        44,
+        "tools/call",
+        json!({"name":"validate_recipe","arguments":{
+            "title":saved["document"]["title"],
+            "servings":saved["document"]["servings"],
+            "body":saved["document"]["body"]
+        }}),
+    )
+    .await;
+    assert_ne!(validation["result"]["isError"], true);
+    let published = rpc(&mut input,&mut output,4,"tools/call",json!({"name":"publish_draft","arguments":{"id":draft["id"],"expected_revision":saved["revision"]}})).await;
+    assert_ne!(published["result"]["isError"], true);
+    let recipe: Value =
+        serde_json::from_str(published["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(recipe["recipe"]["title"], "Resumable soup");
+    second.kill().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
 async fn stdio_adapter_forwards_to_real_temporary_api() {
     let temp = tempfile::tempdir().unwrap();
     let pool = database::connect(&temp.path().join("db.sqlite"))
@@ -63,6 +144,10 @@ async fn stdio_adapter_forwards_to_real_temporary_api() {
     .await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "recipe-mcp");
     assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
+    assert!(initialized["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("explicitly call publish_draft"));
     let negotiated = rpc(
         &mut input,
         &mut output,
@@ -95,8 +180,11 @@ async fn stdio_adapter_forwards_to_real_temporary_api() {
     for expected in [
         "search_recipes",
         "get_recipe",
-        "create_recipe",
-        "update_recipe",
+        "save_draft",
+        "get_draft",
+        "list_drafts",
+        "discard_draft",
+        "publish_draft",
         "delete_recipe",
         "restore_recipe",
         "list_revisions",
@@ -118,11 +206,20 @@ async fn stdio_adapter_forwards_to_real_temporary_api() {
         );
     }
     for name in ["create_recipe", "update_recipe"] {
-        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
-        assert!(tool["description"]
+        assert!(!tools.iter().any(|tool| tool["name"] == name));
+        let removed = rpc(
+            &mut input,
+            &mut output,
+            40,
+            "tools/call",
+            json!({"name":name,"arguments":{}}),
+        )
+        .await;
+        assert_eq!(removed["result"]["isError"], true);
+        assert!(removed["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("get_guidelines"));
+            .contains("unknown tool"));
     }
     let search_tool = tools
         .iter()
@@ -201,14 +298,22 @@ async fn stdio_adapter_forwards_to_real_temporary_api() {
         &mut output,
         4,
         "tools/call",
-        json!({"name":"create_recipe","arguments":{
-            "title":"MCP test dish","servings":2,"body":"Add @tomato{100%g}.","tags":["stdio"]
+        json!({"name":"save_draft","arguments":{
+            "document":{"title":"MCP test dish","servings":2,"body":"Add @tomato{100%g}.","tags":["stdio"]}
         }}),
     )
     .await;
     assert_eq!(create["result"]["isError"], Value::Null);
     let saved: Value =
         serde_json::from_str(create["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let draft_id = saved["id"].as_str().unwrap();
+    let recipe_draft = rpc(&mut input,&mut output,41,"tools/call",json!({"name":"publish_draft","arguments":{"id":draft_id,"expected_revision":saved["revision"]}})).await;
+    let saved: Value = serde_json::from_str(
+        recipe_draft["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     let recipe = &saved["recipe"];
     let id = recipe["id"].as_str().unwrap();
     let revision = recipe["revision"].as_str().unwrap();
@@ -258,11 +363,15 @@ async fn stdio_adapter_forwards_to_real_temporary_api() {
         &mut output,
         17,
         "tools/call",
-        json!({"name":"create_recipe","arguments":{
-            "title":"Invalid MCP body","servings":1,"body":"First step\n~rest{}"
+        json!({"name":"save_draft","arguments":{
+            "document":{"title":"Invalid MCP body","servings":1,"body":"First step\n~rest{}"}
         }}),
     )
     .await;
+    assert_ne!(invalid["result"]["isError"], true);
+    let invalid_draft: Value =
+        serde_json::from_str(invalid["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let invalid = rpc(&mut input,&mut output,42,"tools/call",json!({"name":"publish_draft","arguments":{"id":invalid_draft["id"],"expected_revision":invalid_draft["revision"]}})).await;
     assert_eq!(invalid["result"]["isError"], true);
     let invalid_error = invalid["result"]["content"][0]["text"].as_str().unwrap();
     let error_json = invalid_error.split_once(": ").unwrap().1;
@@ -331,22 +440,15 @@ async fn stdio_adapter_forwards_to_real_temporary_api() {
         }}),
     )
     .await;
-    let attached: Value =
+    let _attached: Value =
         serde_json::from_str(attached["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    let new_revision = attached["revision"].as_str().unwrap();
 
-    let update = rpc(&mut input, &mut output, 7, "tools/call", json!({"name":"update_recipe","arguments":{
-        "id":id,"base_revision":new_revision,"title":"MCP updated","servings":2,"body":"Add @tomato{100%g}.","tags":["stdio"]
-    }})).await;
+    let update = rpc(&mut input,&mut output,7,"tools/call",json!({"name":"save_draft","arguments":{"recipe_id":id,"document":{"title":"MCP updated","servings":2,"body":"Add @tomato{100%g}.","tags":["stdio"]}}})).await;
     assert_ne!(update["result"]["isError"], true);
-    let stale = rpc(&mut input, &mut output, 8, "tools/call", json!({"name":"update_recipe","arguments":{
-        "id":id,"base_revision":new_revision,"title":"Stale","servings":2,"body":"Add @tomato{100%g}."
-    }})).await;
-    assert_eq!(stale["result"]["isError"], true);
-    assert!(stale["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("current_revision_id"));
+    let update: Value =
+        serde_json::from_str(update["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let update = rpc(&mut input,&mut output,8,"tools/call",json!({"name":"publish_draft","arguments":{"id":update["id"],"expected_revision":update["revision"]}})).await;
+    assert_ne!(update["result"]["isError"], true);
 
     let ingredients = rpc(
         &mut input,
@@ -415,17 +517,18 @@ async fn stdio_adapter_forwards_to_real_temporary_api() {
         &mut output,
         23,
         "tools/call",
-        json!({"name":"create_recipe","arguments":{
-            "title":"Garlic side","servings":1,"body":"Use @garlic{1%clove}."
+        json!({"name":"save_draft","arguments":{
+            "document":{"title":"Garlic side","servings":1,"body":"Use @garlic{1%clove}."}
         }}),
     )
     .await;
-    let _second_recipe: Value = serde_json::from_str(
+    let second_draft: Value = serde_json::from_str(
         second_recipe["result"]["content"][0]["text"]
             .as_str()
             .unwrap(),
     )
     .unwrap();
+    let _second_recipe = rpc(&mut input,&mut output,43,"tools/call",json!({"name":"publish_draft","arguments":{"id":second_draft["id"],"expected_revision":second_draft["revision"]}})).await;
     let garlic = rpc(
         &mut input,
         &mut output,

@@ -101,6 +101,9 @@ fn api_router(pool: SqlitePool, images: Arc<dyn ImageStorage>) -> Router {
         .route("/health", get(health))
         .route("/api/v1/openapi.yaml", get(openapi))
         .route("/api/v1/guidelines", get(guidelines))
+        .route("/api/v1/drafts", get(list_drafts).post(save_draft))
+        .route("/api/v1/drafts/:id", get(get_draft).delete(discard_draft))
+        .route("/api/v1/drafts/:id/publish", post(publish_draft))
         .route("/api/v1/recipes", get(list_recipes).post(create_recipe))
         .route("/api/v1/recipes/:id/scaled", get(scaled_recipe))
         .route("/api/v1/recipes/:id/pdf", get(api_recipe_pdf))
@@ -229,6 +232,15 @@ fn token_hash(secret: &str) -> String {
 }
 
 async fn authorize(state: &RecipeService, headers: &HeaderMap) -> Result<String, ApiError> {
+    authorize_identity(state, headers)
+        .await
+        .map(|(label, _)| label)
+}
+
+async fn authorize_identity(
+    state: &RecipeService,
+    headers: &HeaderMap,
+) -> Result<(String, String), ApiError> {
     let value = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -245,7 +257,9 @@ async fn authorize(state: &RecipeService, headers: &HeaderMap) -> Result<String,
             matched_label = Some(row.label);
         }
     }
-    matched_label.ok_or_else(|| ApiError::new("unauthorized", "The bearer token is invalid"))
+    matched_label
+        .map(|label| (label, candidate))
+        .ok_or_else(|| ApiError::new("unauthorized", "The bearer token is invalid"))
 }
 
 #[derive(FromRow)]
@@ -310,6 +324,55 @@ struct SaveResult {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DraftDocument {
+    id: String,
+    revision: i64,
+    base_recipe_id: Option<String>,
+    base_revision: Option<String>,
+    document: serde_json::Value,
+    updated_at: String,
+}
+
+#[derive(FromRow)]
+struct DraftRow {
+    id: String,
+    revision: i64,
+    base_recipe_id: Option<String>,
+    base_revision_id: Option<String>,
+    document: String,
+    updated_at: String,
+}
+
+impl DraftRow {
+    fn document(self) -> Result<DraftDocument, ApiError> {
+        Ok(DraftDocument {
+            id: self.id,
+            revision: self.revision,
+            base_recipe_id: self.base_recipe_id,
+            base_revision: self.base_revision_id,
+            document: serde_json::from_str(&self.document).map_err(internal_error)?,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct DraftWrite {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<i64>,
+    #[serde(default)]
+    recipe_id: Option<String>,
+    document: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct DraftRevision {
+    expected_revision: i64,
+}
+
 #[derive(FromRow)]
 struct RevisionRow {
     id: String,
@@ -351,6 +414,325 @@ impl RevisionRow {
 }
 
 const REVISION_COLUMNS: &str = "r.id, r.recipe_id, r.created_at, r.author_label, r.title, r.description, r.servings, r.tags, r.source_url, r.notes, r.body, r.deleted, r.image_ref";
+
+async fn save_draft(
+    State(state): State<RecipeService>,
+    headers: HeaderMap,
+    request: Result<Json<DraftWrite>, JsonRejection>,
+) -> Result<(StatusCode, Json<DraftDocument>), ApiError> {
+    let (_, owner_id) = authorize_identity(&state, &headers).await?;
+    let Json(mut write) = request?;
+    if !write.document.is_object() {
+        return Err(ApiError::new(
+            "invalid_request",
+            "document must be a JSON object",
+        ));
+    }
+    let timestamp = now();
+    let id = write.id.take().unwrap_or_else(|| new_id("drf"));
+    let mut tx = state.pool.begin().await.map_err(internal_error)?;
+    if let Some(expected) = write.expected_revision {
+        let locked = sqlx::query(
+            "UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?",
+        )
+        .bind(&id)
+        .bind(&owner_id)
+        .bind(expected)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        if locked.rows_affected() == 0 {
+            return Err(ApiError::new(
+                "conflict",
+                "Draft not found or revision changed",
+            ));
+        }
+    } else {
+        // Lock a real existing row before reads. Updating a nonexistent draft ID
+        // may not acquire SQLite's writer lock and leaves a deferred read txn.
+        let locked = if let Some(recipe_id) = write.recipe_id.as_deref() {
+            sqlx::query("UPDATE recipes SET current_revision_id=current_revision_id WHERE id=?")
+                .bind(recipe_id)
+                .execute(&mut *tx)
+                .await
+        } else {
+            sqlx::query("UPDATE api_tokens SET label=label WHERE token_hash=?")
+                .bind(&owner_id)
+                .execute(&mut *tx)
+                .await
+        }
+        .map_err(internal_error)?;
+        if locked.rows_affected() == 0 {
+            return Err(ApiError::new("not_found", "Recipe not found"));
+        }
+    }
+    let existing = sqlx::query_as::<_, DraftRow>(
+        "SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_hash=?",
+    )
+    .bind(&id).bind(&owner_id).fetch_optional(&mut *tx).await.map_err(internal_error)?;
+    let (revision, base_recipe, base_revision, document, status) = if let Some(existing) = existing
+    {
+        let expected = write.expected_revision.ok_or_else(|| {
+            ApiError::new(
+                "invalid_request",
+                "expected_revision is required to revise a draft",
+            )
+        })?;
+        if expected != existing.revision {
+            tx.rollback().await.map_err(internal_error)?;
+            return Err(ApiError::new("conflict", "The draft changed"));
+        }
+        if let Some(object) = write.document.as_object_mut() {
+            let mut merged = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                &existing.document,
+            )
+            .map_err(internal_error)?;
+            merged.append(object);
+            write.document = serde_json::Value::Object(merged);
+        }
+        (
+            existing.revision + 1,
+            existing.base_recipe_id,
+            existing.base_revision_id,
+            write.document,
+            StatusCode::OK,
+        )
+    } else {
+        if write.expected_revision.is_some() {
+            tx.rollback().await.map_err(internal_error)?;
+            return Err(ApiError::new("not_found", "Draft not found"));
+        }
+        let (base_recipe, base_revision) = if let Some(recipe_id) = write.recipe_id.as_deref() {
+            let query = format!(
+                "SELECT {REVISION_COLUMNS} FROM recipes p JOIN recipe_revisions r ON r.id=p.current_revision_id WHERE p.id=?"
+            );
+            let current = sqlx::query_as::<_, RevisionRow>(&query)
+                .bind(recipe_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| ApiError::new("not_found", "Recipe not found"))?;
+            let base_revision = current.id.clone();
+            let mut base: serde_json::Value =
+                serde_json::to_value(current.document()).map_err(internal_error)?;
+            if let (Some(target), Some(fields)) = (base.as_object_mut(), write.document.as_object())
+            {
+                target.extend(fields.clone());
+            }
+            write.document = base;
+            (Some(recipe_id.to_owned()), Some(base_revision))
+        } else {
+            (None, None)
+        };
+        (
+            1,
+            base_recipe,
+            base_revision,
+            write.document,
+            StatusCode::CREATED,
+        )
+    };
+    let encoded = serde_json::to_string(&document).map_err(internal_error)?;
+    let saved = sqlx::query("INSERT INTO recipe_drafts(id,owner_token_hash,revision,base_recipe_id,base_revision_id,document,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision, document=excluded.document, updated_at=excluded.updated_at WHERE owner_token_hash=excluded.owner_token_hash AND revision=?")
+        .bind(&id).bind(&owner_id).bind(revision).bind(&base_recipe).bind(&base_revision).bind(encoded).bind(&timestamp).bind(&timestamp)
+        .bind(revision - 1)
+        .execute(&mut *tx).await.map_err(internal_error)?;
+    if saved.rows_affected() == 0 {
+        return Err(ApiError::new("conflict", "Draft ID is already in use"));
+    }
+    tx.commit().await.map_err(internal_error)?;
+    Ok((
+        status,
+        Json(DraftDocument {
+            id,
+            revision,
+            base_recipe_id: base_recipe,
+            base_revision,
+            document,
+            updated_at: timestamp,
+        }),
+    ))
+}
+
+async fn get_draft(
+    State(state): State<RecipeService>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DraftDocument>, ApiError> {
+    let (_, owner_id) = authorize_identity(&state, &headers).await?;
+    let row = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
+        .bind(id).bind(owner_id).fetch_optional(&state.pool).await.map_err(internal_error)?
+        .ok_or_else(|| ApiError::new("not_found", "Draft not found"))?;
+    Ok(Json(row.document()?))
+}
+
+async fn list_drafts(
+    State(state): State<RecipeService>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DraftDocument>>, ApiError> {
+    let (_, owner_id) = authorize_identity(&state, &headers).await?;
+    let rows = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE owner_token_hash=? ORDER BY updated_at,id")
+        .bind(owner_id).fetch_all(&state.pool).await.map_err(internal_error)?;
+    rows.into_iter()
+        .map(|row| row.document())
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn discard_draft(
+    State(state): State<RecipeService>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    request: Result<Json<DraftRevision>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let (_, owner_id) = authorize_identity(&state, &headers).await?;
+    let Json(revision) = request?;
+    let result =
+        sqlx::query("DELETE FROM recipe_drafts WHERE id=? AND owner_token_hash=? AND revision=?")
+            .bind(id)
+            .bind(owner_id)
+            .bind(revision.expected_revision)
+            .execute(&state.pool)
+            .await
+            .map_err(internal_error)?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::new(
+            "conflict",
+            "Draft not found or revision changed",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn publish_draft(
+    State(state): State<RecipeService>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    request: Result<Json<DraftRevision>, JsonRejection>,
+) -> Result<(StatusCode, Json<SaveResult>), ApiError> {
+    let (author, owner_id) = authorize_identity(&state, &headers).await?;
+    let Json(expected) = request?;
+    let mut tx = state.pool.begin().await.map_err(internal_error)?;
+    // Acquire SQLite's write lock before reading so concurrent publishers serialize
+    // instead of both opening deferred read transactions and failing lock upgrade.
+    let locked = sqlx::query(
+        "UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?",
+    )
+    .bind(&id)
+    .bind(&owner_id)
+    .bind(expected.expected_revision)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_error)?;
+    if locked.rows_affected() == 0 {
+        return Err(ApiError::new(
+            "conflict",
+            "Draft not found or revision changed",
+        ));
+    }
+    let row = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
+        .bind(&id).bind(&owner_id).fetch_optional(&mut *tx).await.map_err(internal_error)?
+        .ok_or_else(|| ApiError::new("not_found", "Draft not found"))?;
+    if row.revision != expected.expected_revision {
+        return Err(ApiError::new("conflict", "The draft changed"));
+    }
+    if let (Some(recipe), Some(base)) = (&row.base_recipe_id, &row.base_revision_id) {
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT current_revision_id FROM recipes WHERE id=? AND deleted=0")
+                .bind(recipe)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+        if current.as_deref() != Some(base.as_str()) {
+            let latest: Option<String> =
+                sqlx::query_scalar("SELECT current_revision_id FROM recipes WHERE id=?")
+                    .bind(recipe)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(internal_error)?;
+            tx.rollback().await.map_err(internal_error)?;
+            return Err(match latest {
+                Some(revision) => {
+                    revision_conflict(revision, "The recipe changed since this draft was started")
+                }
+                None => ApiError::new("not_found", "Recipe not found"),
+            });
+        }
+    }
+    let value: serde_json::Value = serde_json::from_str(&row.document).map_err(internal_error)?;
+    let write: RecipeWrite = serde_json::from_value(value).map_err(|_| {
+        ApiError::new(
+            "invalid_request",
+            "Draft is incomplete; title, servings, and body are required",
+        )
+    })?;
+    validate_write(&write)?;
+    let warnings = state.parse_body(&write.body)?;
+    let (recipe_id, revision_id, image_ref) = if let (Some(recipe), Some(base)) =
+        (&row.base_recipe_id, &row.base_revision_id)
+    {
+        let query = format!(
+            "SELECT {REVISION_COLUMNS} FROM recipe_revisions r WHERE r.recipe_id=? AND r.id=?"
+        );
+        let current = sqlx::query_as::<_, RevisionRow>(&query)
+            .bind(recipe)
+            .bind(base)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| ApiError::new("not_found", "Recipe revision not found"))?;
+        let revision = new_id("rev");
+        let result = sqlx::query("UPDATE recipes SET current_revision_id=? WHERE id=? AND current_revision_id=? AND deleted=0")
+            .bind(&revision).bind(recipe).bind(base).execute(&mut *tx).await.map_err(internal_error)?;
+        if result.rows_affected() == 0 {
+            let latest: Option<String> =
+                sqlx::query_scalar("SELECT current_revision_id FROM recipes WHERE id=?")
+                    .bind(recipe)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(internal_error)?;
+            return Err(match latest {
+                Some(revision) => revision_conflict(revision, "The recipe changed"),
+                None => ApiError::new("not_found", "Recipe not found"),
+            });
+        }
+        (recipe.clone(), revision, current.image_ref)
+    } else {
+        let recipe = new_id("rcp");
+        let revision = new_id("rev");
+        sqlx::query("INSERT INTO recipes(id,current_revision_id) VALUES(?,?)")
+            .bind(&recipe)
+            .bind(&revision)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+        (recipe, revision, None)
+    };
+    insert_revision(
+        &mut tx,
+        &revision_id,
+        &recipe_id,
+        &now(),
+        &author,
+        &write,
+        false,
+        image_ref.as_deref(),
+    )
+    .await?;
+    derive_revision(&mut tx, &revision_id, &write.body, &author).await?;
+    sqlx::query("DELETE FROM recipe_drafts WHERE id=? AND owner_token_hash=? AND revision=?")
+        .bind(&id)
+        .bind(&owner_id)
+        .bind(expected.expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+    let recipe = fetch_revision(&state.pool, &recipe_id, &revision_id)
+        .await?
+        .document();
+    Ok((StatusCode::OK, Json(SaveResult { recipe, warnings })))
+}
 
 async fn create_recipe(
     State(state): State<RecipeService>,
@@ -2488,9 +2870,13 @@ async fn conflict_error(pool: &SqlitePool, id: &str, message: &str) -> Result<Ap
     let Some(current_revision_id) = current else {
         return Ok(ApiError::new("not_found", "Recipe not found"));
     };
+    Ok(revision_conflict(current_revision_id, message))
+}
+
+fn revision_conflict(current_revision_id: String, message: &str) -> ApiError {
     let mut error = ApiError::new("conflict", message);
     error.current_revision_id = Some(current_revision_id);
-    Ok(error)
+    error
 }
 
 async fn ensure_current_base(pool: &SqlitePool, id: &str, base: &str) -> Result<(), ApiError> {

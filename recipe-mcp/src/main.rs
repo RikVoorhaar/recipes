@@ -55,8 +55,11 @@ fn tools() -> Value {
         ("search_recipes", "Search recipes using the API structured filters in query.", ""),
         ("list_recipes", "List current recipes.", ""),
         ("get_recipe", "Get a recipe by ID.", "id"),
-        ("create_recipe", "Read get_guidelines first. Create a recipe from structured metadata and Cooklang body.", "title,servings,body"),
-        ("update_recipe", "Read get_guidelines first. Update a recipe; base_revision is required to prevent overwriting newer edits.", "id,base_revision,title,servings,body"),
+        ("save_draft", "Start or revise an owner-private draft. Existing drafts require id and expected_revision; use recipe_id to start an edit.", "document"),
+        ("get_draft", "Read one of your private drafts.", "id"),
+        ("list_drafts", "List your private drafts.", ""),
+        ("discard_draft", "Discard a draft using its expected_revision.", "id,expected_revision"),
+        ("publish_draft", "Validate and explicitly publish a draft using its expected_revision; publishing consumes it.", "id,expected_revision"),
         ("delete_recipe", "Soft-delete a recipe using its current base_revision.", "id,base_revision"),
         ("restore_recipe", "Restore a soft-deleted recipe using its current base_revision.", "id,base_revision"),
         ("list_revisions", "List a recipe's immutable revisions.", "id"),
@@ -73,7 +76,7 @@ fn tools() -> Value {
         ("merge_ingredients", "Merge this ingredient into a survivor.", "id,survivor"),
         ("list_tags", "List tags with recipe counts.", ""),
         ("validate_recipe", "Dry-run Cooklang validation and print-fit check without saving.", "title,servings,body"),
-        ("get_guidelines", "Get recipe-writing guidelines. Read these before creating or updating recipes.", ""),
+        ("get_guidelines", "Get recipe-writing guidelines. Read before drafting. Workflow: read guidelines, save a draft, read it back and validate, then explicitly publish.", ""),
     ];
     Value::Array(
         names
@@ -93,6 +96,9 @@ fn tools() -> Value {
 fn tool_schema(name: &str, required: &[&str]) -> Value {
     let recipe_fields = json!({
         "id":{"type":"string"},
+        "recipe_id":{"type":"string","description":"Published recipe ID to start an edit draft."},
+        "expected_revision":{"type":"integer"},
+        "document":{"type":"object","description":"Draft fields; incomplete documents are allowed."},
         "revision":{"type":"string"},
         "base_revision":{"type":"string"},
         "title":{"type":"string"},
@@ -178,6 +184,19 @@ async fn invoke(api: &Api, name: &str, args: &Value) -> Result<String, String> {
             .ok_or_else(|| format!("missing required argument: {key}"))
     };
     let (method, path, body) = match name {
+        "save_draft" => (Method::POST, "/api/v1/drafts".into(), Some(args.clone())),
+        "get_draft" => (Method::GET, format!("/api/v1/drafts/{}", text("id")?), None),
+        "list_drafts" => (Method::GET, "/api/v1/drafts".into(), None),
+        "discard_draft" => (
+            Method::DELETE,
+            format!("/api/v1/drafts/{}", text("id")?),
+            Some(json!({"expected_revision":args["expected_revision"]})),
+        ),
+        "publish_draft" => (
+            Method::POST,
+            format!("/api/v1/drafts/{}/publish", text("id")?),
+            Some(json!({"expected_revision":args["expected_revision"]})),
+        ),
         "search_recipes" => (
             Method::GET,
             format!("/api/v1/search{}", search_query_string(args.get("query"))?),
@@ -188,12 +207,6 @@ async fn invoke(api: &Api, name: &str, args: &Value) -> Result<String, String> {
             Method::GET,
             format!("/api/v1/recipes/{}", text("id")?),
             None,
-        ),
-        "create_recipe" => (Method::POST, "/api/v1/recipes".into(), Some(args.clone())),
-        "update_recipe" => (
-            Method::PUT,
-            format!("/api/v1/recipes/{}", text("id")?),
-            Some(args.clone()),
         ),
         "delete_recipe" => (
             Method::DELETE,
@@ -477,6 +490,7 @@ async fn handle(api: &Api, message: Value) -> Value {
         "initialize" => Some(
             json!({"protocolVersion":negotiate_protocol(params.get("protocolVersion")),
             "capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false}},
+            "instructions":"Recipe authoring workflow: call get_guidelines first, save or revise an owner-private draft, read it back with get_draft, validate the candidate, and only then explicitly call publish_draft. Drafts persist across sessions. Do not use HTTP recipe create/update routes for agent authoring.",
             "serverInfo":{"name":"recipe-mcp","version":"0.1.0"}}),
         ),
         "ping" => Some(json!({})),

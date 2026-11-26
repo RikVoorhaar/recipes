@@ -96,6 +96,105 @@ fn tool_json(result: &Value) -> Value {
 }
 
 #[tokio::test]
+async fn batching_depends_on_protocol_version_and_preserves_identity() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    let batch = json!([
+        {"jsonrpc":"2.0","id":1,"method":"ping"},
+        {"jsonrpc":"2.0","method":"notifications/initialized"},
+        {"jsonrpc":"2.0","id":"save","method":"tools/call","params":{"name":"save_draft","arguments":{"document":{"title":"Private"}}}},
+        {"jsonrpc":"2.0","id":3,"method":"unknown"},
+        42
+    ]);
+    // Older clients omit the version header; explicit 2025-03-26 also batches.
+    for version in [None, Some("2025-03-26"), Some("2024-11-05")] {
+        let mut request = client.post(&url).bearer_auth("first").json(&batch);
+        if let Some(version) = version {
+            request = request.header("mcp-protocol-version", version);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let values: Value = response.json().await.unwrap();
+        let responses = values.as_array().unwrap();
+        assert_eq!(responses.len(), 4);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[1]["id"], "save");
+        let saved = tool_json(&responses[1]["result"]);
+        assert_eq!(responses[2]["error"]["code"], -32601);
+        assert_eq!(responses[3]["error"]["code"], -32600);
+        assert!(responses[3]["id"].is_null());
+        let other = tool(
+            &client,
+            &url,
+            "x-api-key",
+            "second",
+            "get_draft",
+            json!({"id":saved["id"]}),
+        )
+        .await;
+        assert_eq!(other["isError"], true);
+    }
+    let notifications = json!([
+        {"jsonrpc":"2.0","method":"notifications/initialized"},
+        {"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}
+    ]);
+    let response = client
+        .post(&url)
+        .bearer_auth("first")
+        .json(&notifications)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    assert!(response.bytes().await.unwrap().is_empty());
+    for version in ["2025-06-18", "2025-11-25"] {
+        let response = client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-protocol-version", version)
+            .json(&batch)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+    }
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("first")
+            .json(&json!([]))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("wrong")
+            .json(&batch)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("first")
+            .header("origin", "https://evil.example")
+            .json(&batch)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+}
+
+#[tokio::test]
 async fn complete_workflow_for_both_headers_and_private_drafts() {
     let (_dir, url) = server().await;
     let client = reqwest::Client::new();

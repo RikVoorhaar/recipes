@@ -55,6 +55,18 @@ fn rpc_error(code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":null,"error":{"code":code,"message":message}})
 }
 
+fn valid_request(message: &Value) -> bool {
+    message.is_object()
+        && message["jsonrpc"] == "2.0"
+        && message["method"].as_str().is_some()
+        && message
+            .get("id")
+            .is_none_or(|id| id.is_string() || id.is_number() || id.is_null())
+        && message
+            .get("params")
+            .is_none_or(|p| p.is_object() || p.is_array())
+}
+
 pub(crate) async fn check_origin(
     State(origins): State<Arc<Vec<String>>>,
     request: Request,
@@ -109,11 +121,12 @@ pub(crate) async fn post(
         }
         Err(error) => return error.into_response(),
     };
-    match one_header(&headers, "mcp-protocol-version") {
-        Ok(None) => {}
-        Ok(Some(version)) if mcp::SUPPORTED_PROTOCOLS.contains(&version) => {}
+    let version = match one_header(&headers, "mcp-protocol-version") {
+        // No session state is kept, so the backwards-compatibility default applies.
+        Ok(None) => "2025-03-26",
+        Ok(Some(version)) if mcp::SUPPORTED_PROTOCOLS.contains(&version) => version,
         _ => return StatusCode::BAD_REQUEST.into_response(),
-    }
+    };
     if !matches!(one_header(&headers, "content-type"), Ok(Some(value)) if value.split(';').next().is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json")))
     {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
@@ -128,16 +141,29 @@ pub(crate) async fn post(
                 .into_response()
         }
     };
-    let valid = message.is_object()
-        && message["jsonrpc"] == "2.0"
-        && message["method"].as_str().is_some()
-        && message
-            .get("id")
-            .is_none_or(|id| id.is_string() || id.is_number() || id.is_null())
-        && message
-            .get("params")
-            .is_none_or(|p| p.is_object() || p.is_array());
-    if !valid {
+    if let Value::Array(messages) = message {
+        if !matches!(version, "2025-03-26" | "2024-11-05") || messages.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(rpc_error(-32600, "Invalid Request")),
+            )
+                .into_response();
+        }
+        let mut responses = Vec::new();
+        for message in messages {
+            if !valid_request(&message) {
+                responses.push(rpc_error(-32600, "Invalid Request"));
+            } else if let Some(response) = mcp::handle(&state, &caller, message).await {
+                responses.push(response);
+            }
+        }
+        return if responses.is_empty() {
+            StatusCode::ACCEPTED.into_response()
+        } else {
+            Json(responses).into_response()
+        };
+    }
+    if !valid_request(&message) {
         return (
             StatusCode::BAD_REQUEST,
             Json(rpc_error(-32600, "Invalid Request")),

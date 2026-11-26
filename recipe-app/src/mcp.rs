@@ -537,7 +537,8 @@ pub(crate) async fn handle(
     Some(json!({"jsonrpc":"2.0","id":id,"result":result}))
 }
 
-const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+pub(crate) const SUPPORTED_PROTOCOLS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 fn negotiate_protocol(requested: Option<&Value>) -> &'static str {
     requested

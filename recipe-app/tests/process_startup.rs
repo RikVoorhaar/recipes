@@ -11,6 +11,44 @@ const SECOND_CONFIGURED_TOKEN: &str = "second-configured-token-secret-sentinel";
 const AUTHORIZATION_SENTINEL: &str = "authorization-header-secret-sentinel";
 
 #[tokio::test]
+async fn configured_browser_origins_are_enforced_by_the_binary() {
+    let directory = TempDir::new().unwrap();
+    let address = available_address();
+    let child = Command::new(env!("CARGO_BIN_EXE_recipe-app"))
+        .env_clear()
+        .env("APP_CONFIG_FILE", directory.path().join("missing.toml"))
+        .env("APP__BIND_ADDR", address.to_string())
+        .env("APP__DATABASE_PATH", directory.path().join("db.sqlite"))
+        .env("APP__CONTENT_DIR", directory.path().join("content"))
+        .env("APP__API_TOKENS", "owner:secret")
+        .env(
+            "APP__MCP_ALLOWED_ORIGINS",
+            "http://localhost:6274,https://trusted.example",
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    request_health(address).await;
+    let client = reqwest::Client::new();
+    for (origin, status) in [
+        ("https://trusted.example", 200),
+        ("https://bad.example", 403),
+    ] {
+        let response = client
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth("secret")
+            .header("origin", origin)
+            .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+    }
+    stop_and_capture(child);
+}
+
+#[tokio::test]
 async fn binary_starts_restarts_and_never_logs_tokens_or_authorization_headers() {
     let directory = TempDir::new().expect("temporary directory");
     let address = available_address();

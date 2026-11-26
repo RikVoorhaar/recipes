@@ -13,50 +13,73 @@ use crate::{
     SearchQuery, GENERATED_COVER_MIME, RECIPE_GUIDELINES,
 };
 
+// Keep the wire name, description, and required fields together. The enum makes
+// dispatch exhaustive while this declaration also supplies the entire catalog.
+macro_rules! define_tools {
+    ($( $variant:ident => ($name:literal, $description:literal, $required:literal) ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Tool { $( $variant ),+ }
+
+        impl Tool {
+            const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            fn parse(name: &str) -> Option<Self> {
+                match name { $( $name => Some(Self::$variant), )+ _ => None }
+            }
+
+            fn metadata(self) -> (&'static str, &'static str, &'static str) {
+                match self { $( Self::$variant => ($name, $description, $required), )+ }
+            }
+        }
+    };
+}
+
+define_tools! {
+    SearchRecipes => ("search_recipes", "Search recipes using the API structured filters in query.", ""),
+    ListRecipes => ("list_recipes", "List current recipes.", ""),
+    GetRecipe => ("get_recipe", "Get a recipe by ID.", "id"),
+    SaveDraft => ("save_draft", "Start or revise an owner-private draft. Existing drafts require id and expected_revision; use recipe_id to start an edit.", "document"),
+    GetDraft => ("get_draft", "Read one of your private drafts.", "id"),
+    ListDrafts => ("list_drafts", "List your private drafts.", ""),
+    DiscardDraft => ("discard_draft", "Discard a draft using its expected_revision.", "id,expected_revision"),
+    PublishDraft => ("publish_draft", "Validate and explicitly publish a draft using its expected_revision; optionally select its generated image_ref. Publishing consumes it.", "id,expected_revision"),
+    GenerateCover => ("generate_cover", "By default make one cover attempt for a new dish unless the user opts out. Provide exactly one target: draft_id with expected_revision for a private candidate, or recipe_id with base_revision and optional replace for immediate attachment. Inspect a draft preview before explicitly publishing; if generation fails, report it and proceed without a cover when publication was requested.", ""),
+    DeleteRecipe => ("delete_recipe", "Soft-delete a recipe using its current base_revision.", "id,base_revision"),
+    RestoreRecipe => ("restore_recipe", "Restore a soft-deleted recipe using its current base_revision.", "id,base_revision"),
+    ListRevisions => ("list_revisions", "List a recipe's immutable revisions.", "id"),
+    GetRevision => ("get_revision", "Get one immutable recipe revision.", "id,revision"),
+    RestoreRevision => ("restore_revision", "Restore a historical revision as a new current revision; base_revision is required.", "id,revision,base_revision"),
+    AttachImage => ("attach_image", "Attach or replace an uploaded image, requiring base_revision.", "id,base_revision,image_ref"),
+    DetachImage => ("detach_image", "Detach the image, requiring base_revision.", "id,base_revision"),
+    ListIngredients => ("list_ingredients", "List/search canonical ingredients.", ""),
+    GetIngredient => ("get_ingredient", "Get ingredient details and linked recipes.", "id"),
+    AddIngredientAlias => ("add_ingredient_alias", "Add an alias to an ingredient.", "id,alias"),
+    RemoveIngredientAlias => ("remove_ingredient_alias", "Remove an ingredient alias.", "id,alias"),
+    RenameIngredient => ("rename_ingredient", "Rename a canonical ingredient.", "id,name"),
+    MergeIngredients => ("merge_ingredients", "Merge this ingredient into a survivor.", "id,survivor"),
+    ListTags => ("list_tags", "List tags with recipe counts.", ""),
+    ValidateRecipe => ("validate_recipe", "Dry-run Cooklang validation and print-fit check without saving.", "title,servings,body"),
+    GetGuidelines => ("get_guidelines", "Get recipe-writing guidelines. Read before drafting. Workflow: read guidelines, save a draft, read it back and validate, then explicitly publish.", ""),
+}
+
 fn tools() -> Value {
-    let names = [
-        ("search_recipes", "Search recipes using the API structured filters in query.", ""),
-        ("list_recipes", "List current recipes.", ""),
-        ("get_recipe", "Get a recipe by ID.", "id"),
-        ("save_draft", "Start or revise an owner-private draft. Existing drafts require id and expected_revision; use recipe_id to start an edit.", "document"),
-        ("get_draft", "Read one of your private drafts.", "id"),
-        ("list_drafts", "List your private drafts.", ""),
-        ("discard_draft", "Discard a draft using its expected_revision.", "id,expected_revision"),
-        ("publish_draft", "Validate and explicitly publish a draft using its expected_revision; optionally select its generated image_ref. Publishing consumes it.", "id,expected_revision"),
-        ("generate_cover", "By default make one cover attempt for a new dish unless the user opts out. Provide exactly one target: draft_id with expected_revision for a private candidate, or recipe_id with base_revision and optional replace for immediate attachment. Inspect a draft preview before explicitly publishing; if generation fails, report it and proceed without a cover when publication was requested.", ""),
-        ("delete_recipe", "Soft-delete a recipe using its current base_revision.", "id,base_revision"),
-        ("restore_recipe", "Restore a soft-deleted recipe using its current base_revision.", "id,base_revision"),
-        ("list_revisions", "List a recipe's immutable revisions.", "id"),
-        ("get_revision", "Get one immutable recipe revision.", "id,revision"),
-        ("restore_revision", "Restore a historical revision as a new current revision; base_revision is required.", "id,revision,base_revision"),
-        ("attach_image", "Attach or replace an uploaded image, requiring base_revision.", "id,base_revision,image_ref"),
-        ("detach_image", "Detach the image, requiring base_revision.", "id,base_revision"),
-        ("list_ingredients", "List/search canonical ingredients.", ""),
-        ("get_ingredient", "Get ingredient details and linked recipes.", "id"),
-        ("add_ingredient_alias", "Add an alias to an ingredient.", "id,alias"),
-        ("remove_ingredient_alias", "Remove an ingredient alias.", "id,alias"),
-        ("rename_ingredient", "Rename a canonical ingredient.", "id,name"),
-        ("merge_ingredients", "Merge this ingredient into a survivor.", "id,survivor"),
-        ("list_tags", "List tags with recipe counts.", ""),
-        ("validate_recipe", "Dry-run Cooklang validation and print-fit check without saving.", "title,servings,body"),
-        ("get_guidelines", "Get recipe-writing guidelines. Read before drafting. Workflow: read guidelines, save a draft, read it back and validate, then explicitly publish.", ""),
-    ];
     Value::Array(
-        names
+        Tool::ALL
             .iter()
-            .map(|(name, description, required)| {
+            .map(|&tool| {
+                let (name, description, required) = tool.metadata();
                 let required: Vec<&str> = required.split(',').filter(|s| !s.is_empty()).collect();
                 json!({
-                    "name":name,
-                    "description":description,
-                    "inputSchema":tool_schema(name, &required)
+                    "name": name,
+                    "description": description,
+                    "inputSchema": tool_schema(tool, &required)
                 })
             })
             .collect(),
     )
 }
 
-fn tool_schema(name: &str, required: &[&str]) -> Value {
+fn tool_schema(tool: Tool, required: &[&str]) -> Value {
     let recipe_fields = json!({
         "id":{"type":"string"},
         "recipe_id":{"type":"string","description":"Published recipe ID to start an edit draft."},
@@ -97,8 +120,8 @@ fn tool_schema(name: &str, required: &[&str]) -> Value {
         "limit":{"type":"integer","minimum":1,"maximum":200},
         "offset":{"type":"integer","minimum":0}
     });
-    match name {
-        "search_recipes" => json!({
+    match tool {
+        Tool::SearchRecipes => json!({
             "type":"object",
             "properties":{"query":{
                 "type":"object",
@@ -108,7 +131,7 @@ fn tool_schema(name: &str, required: &[&str]) -> Value {
             }},
             "additionalProperties":false
         }),
-        "validate_recipe" => json!({
+        Tool::ValidateRecipe => json!({
             "type":"object",
             "properties":{
                 "title":{"type":"string"},
@@ -124,7 +147,7 @@ fn tool_schema(name: &str, required: &[&str]) -> Value {
             "required":["title","servings","body"],
             "additionalProperties":false
         }),
-        "generate_cover" => json!({
+        Tool::GenerateCover => json!({
             "type":"object",
             "properties":{
                 "draft_id":{"type":"string"},
@@ -141,12 +164,32 @@ fn tool_schema(name: &str, required: &[&str]) -> Value {
             ],
             "additionalProperties":false
         }),
-        "list_ingredients" => json!({
+        Tool::ListIngredients => json!({
             "type":"object",
             "properties":{"q":{"type":"string","description":"Optional canonical ingredient name search."}},
             "additionalProperties":false
         }),
-        _ => json!({
+        Tool::ListRecipes
+        | Tool::GetRecipe
+        | Tool::SaveDraft
+        | Tool::GetDraft
+        | Tool::ListDrafts
+        | Tool::DiscardDraft
+        | Tool::PublishDraft
+        | Tool::DeleteRecipe
+        | Tool::RestoreRecipe
+        | Tool::ListRevisions
+        | Tool::GetRevision
+        | Tool::RestoreRevision
+        | Tool::AttachImage
+        | Tool::DetachImage
+        | Tool::GetIngredient
+        | Tool::AddIngredientAlias
+        | Tool::RemoveIngredientAlias
+        | Tool::RenameIngredient
+        | Tool::MergeIngredients
+        | Tool::ListTags
+        | Tool::GetGuidelines => json!({
             "type":"object",
             "properties":recipe_fields,
             "required":required,
@@ -224,38 +267,38 @@ fn ingredient_query(args: &Value) -> Result<IngredientQuery, String> {
 async fn invoke(
     service: &RecipeService,
     caller: &CallerIdentity,
-    name: &str,
+    tool: Tool,
     args: &Value,
-) -> Result<String, String> {
+) -> Result<Vec<Value>, String> {
     let id = || required_text(args, "id");
     let base = || required_text(args, "base_revision");
-    match name {
-        "get_guidelines" => Ok(RECIPE_GUIDELINES.into()),
-        "save_draft" => result_text(save_draft(service, caller, arguments(args)?).await),
-        "get_draft" => result_text(get_draft(service, caller, id()?).await),
-        "list_drafts" => result_text(list_drafts(service, caller).await),
-        "discard_draft" => {
+    match tool {
+        Tool::GetGuidelines => Ok(RECIPE_GUIDELINES.into()),
+        Tool::SaveDraft => result_text(save_draft(service, caller, arguments(args)?).await),
+        Tool::GetDraft => result_text(get_draft(service, caller, id()?).await),
+        Tool::ListDrafts => result_text(list_drafts(service, caller).await),
+        Tool::DiscardDraft => {
             discard_draft(service, caller, id()?, arguments(args)?)
                 .await
                 .map_err(service_error)?;
             Ok(String::new())
         }
-        "publish_draft" => {
+        Tool::PublishDraft => {
             result_text(publish_draft(service, caller, id()?, arguments(args)?).await)
         }
-        "search_recipes" => {
+        Tool::SearchRecipes => {
             result_text(search_recipes(service, search_query(args.get("query"))?).await)
         }
-        "list_recipes" => result_text(list_recipes(service).await),
-        "get_recipe" => result_text(get_recipe(service, id()?).await),
-        "delete_recipe" | "restore_recipe" | "restore_revision" => result_text(
+        Tool::ListRecipes => result_text(list_recipes(service).await),
+        Tool::GetRecipe => result_text(get_recipe(service, id()?).await),
+        Tool::DeleteRecipe | Tool::RestoreRecipe | Tool::RestoreRevision => result_text(
             append_state_revision(
                 service,
                 caller,
                 id()?,
                 base()?,
-                name == "delete_recipe",
-                if name == "restore_revision" {
+                tool == Tool::DeleteRecipe,
+                if tool == Tool::RestoreRevision {
                     Some(required_text(args, "revision")?)
                 } else {
                     None
@@ -263,11 +306,11 @@ async fn invoke(
             )
             .await,
         ),
-        "list_revisions" => result_text(list_revisions(service, id()?).await),
-        "get_revision" => {
+        Tool::ListRevisions => result_text(list_revisions(service, id()?).await),
+        Tool::GetRevision => {
             result_text(get_revision(service, id()?, required_text(args, "revision")?).await)
         }
-        "attach_image" => result_text(
+        Tool::AttachImage => result_text(
             attach_image(
                 service,
                 caller,
@@ -279,12 +322,14 @@ async fn invoke(
             )
             .await,
         ),
-        "detach_image" => {
+        Tool::DetachImage => {
             result_text(append_image_revision(service, caller, id()?, base()?, None).await)
         }
-        "list_ingredients" => result_text(list_ingredients(service, ingredient_query(args)?).await),
-        "get_ingredient" => result_text(get_ingredient(service, id()?).await),
-        "add_ingredient_alias" => {
+        Tool::ListIngredients => {
+            result_text(list_ingredients(service, ingredient_query(args)?).await)
+        }
+        Tool::GetIngredient => result_text(get_ingredient(service, id()?).await),
+        Tool::AddIngredientAlias => {
             add_alias(
                 service,
                 caller,
@@ -297,13 +342,13 @@ async fn invoke(
             .map_err(service_error)?;
             Ok(String::new())
         }
-        "remove_ingredient_alias" => {
+        Tool::RemoveIngredientAlias => {
             remove_alias(service, caller, id()?, required_text(args, "alias")?)
                 .await
                 .map_err(service_error)?;
             Ok(String::new())
         }
-        "rename_ingredient" => {
+        Tool::RenameIngredient => {
             rename_ingredient(
                 service,
                 caller,
@@ -316,7 +361,7 @@ async fn invoke(
             .map_err(service_error)?;
             Ok(String::new())
         }
-        "merge_ingredients" => {
+        Tool::MergeIngredients => {
             merge_ingredient(
                 service,
                 caller,
@@ -329,10 +374,11 @@ async fn invoke(
             .map_err(service_error)?;
             Ok(String::new())
         }
-        "list_tags" => result_text(list_tags(service).await),
-        "validate_recipe" => result_text(validate_recipe(service, arguments(args)?).await),
-        _ => Err(format!("unknown tool: {name}")),
+        Tool::ListTags => result_text(list_tags(service).await),
+        Tool::ValidateRecipe => result_text(validate_recipe(service, arguments(args)?).await),
+        Tool::GenerateCover => return invoke_generate_cover(service, caller, args).await,
     }
+    .map(|text| vec![text_content(text)])
 }
 
 async fn invoke_generate_cover(
@@ -444,7 +490,7 @@ fn text_content(text: String) -> Value {
 }
 
 const GUIDELINES_URI: &str = "recipe://guidelines";
-const INSTRUCTIONS: &str = "Recipe authoring workflow: call get_guidelines first, save or revise an owner-private draft, read it back with get_draft, validate the candidate, and only then explicitly call publish_draft. By default make one generate_cover attempt for a new dish unless the user opts out; inspect the private preview before explicitly publishing. If generation fails, report it and publish without a cover when requested. Drafts persist across sessions. Do not use HTTP recipe create/update routes for agent authoring.";
+const INSTRUCTIONS: &str = include_str!("../guidelines/mcp-instructions.txt");
 
 /// Dispatch a decoded message after the transport has authenticated the caller.
 /// Notifications have no response.
@@ -477,12 +523,9 @@ pub(crate) async fn handle(
             let name = params["name"].as_str().unwrap_or("");
             let empty = json!({});
             let args = params.get("arguments").unwrap_or(&empty);
-            let content = if name == "generate_cover" {
-                invoke_generate_cover(service, caller, args).await
-            } else {
-                invoke(service, caller, name, args)
-                    .await
-                    .map(|text| vec![text_content(text)])
+            let content = match Tool::parse(name) {
+                Some(tool) => invoke(service, caller, tool, args).await,
+                None => Err(format!("unknown tool: {name}")),
             };
             match content {
                 Ok(content) => json!({"content":content}),
@@ -619,6 +662,12 @@ mod tests {
         let listed = rpc(&service, &owner, "tools/list", json!({})).await;
         let catalog = listed["result"]["tools"].as_array().unwrap();
         assert_eq!(catalog.len(), 25);
+        let mut names = std::collections::HashSet::new();
+        for (entry, tool) in catalog.iter().zip(Tool::ALL) {
+            let name = entry["name"].as_str().unwrap();
+            assert!(names.insert(name), "duplicate tool name: {name}");
+            assert_eq!(Tool::parse(name), Some(*tool));
+        }
         assert!(!catalog.iter().any(|tool| tool["name"] == "upload_image"));
         let removed = tool(
             &service,

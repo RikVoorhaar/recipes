@@ -1,6 +1,9 @@
 pub mod config;
 pub mod cover;
 pub mod database;
+// The HTTP MCP transport in #10 will wire this module into the router.
+#[allow(dead_code)]
+mod mcp;
 mod pdf;
 mod recipe_web;
 pub mod storage;
@@ -121,15 +124,21 @@ fn api_router(
         .route("/health", get(health))
         .route("/api/v1/openapi.yaml", get(openapi))
         .route("/api/v1/guidelines", get(guidelines))
-        .route("/api/v1/drafts", get(list_drafts).post(save_draft))
-        .route("/api/v1/drafts/:id", get(get_draft).delete(discard_draft))
-        .route("/api/v1/drafts/:id/publish", post(publish_draft))
-        .route("/api/v1/drafts/:id/cover", post(generate_draft_cover))
-        .route("/api/v1/drafts/:id/covers/:image_ref", get(get_draft_cover))
-        .route("/api/v1/recipes", get(list_recipes).post(create_recipe))
+        .route("/api/v1/drafts", get(api_list_drafts).post(api_save_draft))
+        .route(
+            "/api/v1/drafts/:id",
+            get(api_get_draft).delete(api_discard_draft),
+        )
+        .route("/api/v1/drafts/:id/publish", post(api_publish_draft))
+        .route("/api/v1/drafts/:id/cover", post(api_generate_draft_cover))
+        .route(
+            "/api/v1/drafts/:id/covers/:image_ref",
+            get(api_get_draft_cover),
+        )
+        .route("/api/v1/recipes", get(api_list_recipes).post(create_recipe))
         .route("/api/v1/recipes/:id/scaled", get(scaled_recipe))
         .route("/api/v1/recipes/:id/pdf", get(api_recipe_pdf))
-        .route("/api/v1/recipes/validate", post(validate_recipe))
+        .route("/api/v1/recipes/validate", post(api_validate_recipe))
         .route("/", get(public_index))
         .route("/recipes", get(public_index))
         .route("/ingredients", get(public_ingredients))
@@ -137,36 +146,36 @@ fn api_router(
         .route("/assets/Lora.ttf", get(public_font))
         .route("/tags/:tag", get(public_tag))
         .route("/recipes/:id", get(public_recipe))
-        .route("/api/v1/search", get(search_recipes))
+        .route("/api/v1/search", get(api_search_recipes))
         .route("/api/v1/images", post(upload_image))
         .route("/images/:ref", get(get_image))
         .route(
             "/api/v1/recipes/:id/image",
-            post(attach_image).delete(detach_image),
+            post(api_attach_image).delete(detach_image),
         )
-        .route("/api/v1/recipes/:id/cover", post(generate_recipe_cover))
+        .route("/api/v1/recipes/:id/cover", post(api_generate_recipe_cover))
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
-        .route("/api/v1/tags", get(list_tags))
-        .route("/api/v1/ingredients", get(list_ingredients))
+        .route("/api/v1/tags", get(api_list_tags))
+        .route("/api/v1/ingredients", get(api_list_ingredients))
         .route(
             "/api/v1/ingredients/:id",
-            get(get_ingredient).put(rename_ingredient),
+            get(api_get_ingredient).put(api_rename_ingredient),
         )
-        .route("/api/v1/ingredients/:id/aliases", post(add_alias))
+        .route("/api/v1/ingredients/:id/aliases", post(api_add_alias))
         .route(
             "/api/v1/ingredients/:id/aliases/:alias",
-            delete(remove_alias),
+            delete(api_remove_alias),
         )
-        .route("/api/v1/ingredients/:id/merge", post(merge_ingredient))
+        .route("/api/v1/ingredients/:id/merge", post(api_merge_ingredient))
         .route(
             "/api/v1/recipes/:id",
-            get(get_recipe).put(update_recipe).delete(delete_recipe),
+            get(api_get_recipe).put(update_recipe).delete(delete_recipe),
         )
         .route("/api/v1/recipes/:id/restore", post(restore_recipe))
-        .route("/api/v1/recipes/:id/revisions", get(list_revisions))
+        .route("/api/v1/recipes/:id/revisions", get(api_list_revisions))
         .route(
             "/api/v1/recipes/:id/revisions/:revision",
-            get(get_revision).post(restore_revision),
+            get(api_get_revision).post(restore_revision),
         )
         .layer(middleware::from_fn(log_request))
         .with_state(state)
@@ -257,13 +266,18 @@ fn token_hash(secret: &str) -> String {
 async fn authorize(state: &RecipeService, headers: &HeaderMap) -> Result<String, ApiError> {
     authorize_identity(state, headers)
         .await
-        .map(|(label, _)| label)
+        .map(|caller| caller.label)
+}
+
+struct CallerIdentity {
+    label: String,
+    token_hash: String,
 }
 
 async fn authorize_identity(
     state: &RecipeService,
     headers: &HeaderMap,
-) -> Result<(String, String), ApiError> {
+) -> Result<CallerIdentity, ApiError> {
     let value = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -281,7 +295,10 @@ async fn authorize_identity(
         }
     }
     matched_label
-        .map(|label| (label, candidate))
+        .map(|label| CallerIdentity {
+            label,
+            token_hash: candidate,
+        })
         .ok_or_else(|| ApiError::new("unauthorized", "The bearer token is invalid"))
 }
 
@@ -445,13 +462,28 @@ impl RevisionRow {
 
 const REVISION_COLUMNS: &str = "r.id, r.recipe_id, r.created_at, r.author_label, r.title, r.description, r.servings, r.tags, r.source_url, r.notes, r.body, r.deleted, r.image_ref";
 
-async fn save_draft(
+async fn api_save_draft(
     State(state): State<RecipeService>,
     headers: HeaderMap,
     request: Result<Json<DraftWrite>, JsonRejection>,
 ) -> Result<(StatusCode, Json<DraftDocument>), ApiError> {
-    let (_, owner_id) = authorize_identity(&state, &headers).await?;
-    let Json(mut write) = request?;
+    let caller = authorize_identity(&state, &headers).await?;
+    let Json(write) = request?;
+    let draft = save_draft(&state, &caller, write).await?;
+    let status = if draft.revision == 1 {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(draft)))
+}
+
+async fn save_draft(
+    state: &RecipeService,
+    caller: &CallerIdentity,
+    mut write: DraftWrite,
+) -> Result<DraftDocument, ApiError> {
+    let owner_id = &caller.token_hash;
     if !write.document.is_object() {
         return Err(ApiError::new(
             "invalid_request",
@@ -466,7 +498,7 @@ async fn save_draft(
             "UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?",
         )
         .bind(&id)
-        .bind(&owner_id)
+        .bind(owner_id)
         .bind(expected)
         .execute(&mut *tx)
         .await
@@ -487,7 +519,7 @@ async fn save_draft(
                 .await
         } else {
             sqlx::query("UPDATE api_tokens SET label=label WHERE token_hash=?")
-                .bind(&owner_id)
+                .bind(owner_id)
                 .execute(&mut *tx)
                 .await
         }
@@ -499,9 +531,8 @@ async fn save_draft(
     let existing = sqlx::query_as::<_, DraftRow>(
         "SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_hash=?",
     )
-    .bind(&id).bind(&owner_id).fetch_optional(&mut *tx).await.map_err(internal_error)?;
-    let (revision, base_recipe, base_revision, document, status) = if let Some(existing) = existing
-    {
+    .bind(&id).bind(owner_id).fetch_optional(&mut *tx).await.map_err(internal_error)?;
+    let (revision, base_recipe, base_revision, document) = if let Some(existing) = existing {
         let expected = write.expected_revision.ok_or_else(|| {
             ApiError::new(
                 "invalid_request",
@@ -525,7 +556,6 @@ async fn save_draft(
             existing.base_recipe_id,
             existing.base_revision_id,
             write.document,
-            StatusCode::OK,
         )
     } else {
         if write.expected_revision.is_some() {
@@ -554,69 +584,84 @@ async fn save_draft(
         } else {
             (None, None)
         };
-        (
-            1,
-            base_recipe,
-            base_revision,
-            write.document,
-            StatusCode::CREATED,
-        )
+        (1, base_recipe, base_revision, write.document)
     };
     let encoded = serde_json::to_string(&document).map_err(internal_error)?;
     let saved = sqlx::query("INSERT INTO recipe_drafts(id,owner_token_hash,revision,base_recipe_id,base_revision_id,document,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision, document=excluded.document, updated_at=excluded.updated_at WHERE owner_token_hash=excluded.owner_token_hash AND revision=?")
-        .bind(&id).bind(&owner_id).bind(revision).bind(&base_recipe).bind(&base_revision).bind(encoded).bind(&timestamp).bind(&timestamp)
+        .bind(&id).bind(owner_id).bind(revision).bind(&base_recipe).bind(&base_revision).bind(encoded).bind(&timestamp).bind(&timestamp)
         .bind(revision - 1)
         .execute(&mut *tx).await.map_err(internal_error)?;
     if saved.rows_affected() == 0 {
         return Err(ApiError::new("conflict", "Draft ID is already in use"));
     }
     tx.commit().await.map_err(internal_error)?;
-    Ok((
-        status,
-        Json(DraftDocument {
-            id,
-            revision,
-            base_recipe_id: base_recipe,
-            base_revision,
-            document,
-            updated_at: timestamp,
-        }),
-    ))
+    Ok(DraftDocument {
+        id,
+        revision,
+        base_recipe_id: base_recipe,
+        base_revision,
+        document,
+        updated_at: timestamp,
+    })
 }
 
-async fn get_draft(
+async fn api_get_draft(
     State(state): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<DraftDocument>, ApiError> {
-    let (_, owner_id) = authorize_identity(&state, &headers).await?;
-    let row = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
-        .bind(id).bind(owner_id).fetch_optional(&state.pool).await.map_err(internal_error)?
-        .ok_or_else(|| ApiError::new("not_found", "Draft not found"))?;
-    Ok(Json(row.document()?))
+    let caller = authorize_identity(&state, &headers).await?;
+    get_draft(&state, &caller, &id).await.map(Json)
 }
 
-async fn list_drafts(
+async fn get_draft(
+    state: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+) -> Result<DraftDocument, ApiError> {
+    let row = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
+        .bind(id).bind(&caller.token_hash).fetch_optional(&state.pool).await.map_err(internal_error)?
+        .ok_or_else(|| ApiError::new("not_found", "Draft not found"))?;
+    row.document()
+}
+
+async fn api_list_drafts(
     State(state): State<RecipeService>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<DraftDocument>>, ApiError> {
-    let (_, owner_id) = authorize_identity(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
+    list_drafts(&state, &caller).await.map(Json)
+}
+
+async fn list_drafts(
+    state: &RecipeService,
+    caller: &CallerIdentity,
+) -> Result<Vec<DraftDocument>, ApiError> {
     let rows = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE owner_token_hash=? ORDER BY updated_at,id")
-        .bind(owner_id).fetch_all(&state.pool).await.map_err(internal_error)?;
+        .bind(&caller.token_hash).fetch_all(&state.pool).await.map_err(internal_error)?;
     rows.into_iter()
         .map(|row| row.document())
         .collect::<Result<Vec<_>, _>>()
-        .map(Json)
 }
 
-async fn discard_draft(
+async fn api_discard_draft(
     State(state): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
     request: Result<Json<ExpectedDraftRevision>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let (_, owner_id) = authorize_identity(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
     let Json(revision) = request?;
+    discard_draft(&state, &caller, &id, revision).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn discard_draft(
+    state: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+    revision: ExpectedDraftRevision,
+) -> Result<(), ApiError> {
     if revision.expected_revision <= 0 {
         return Err(ApiError::new(
             "invalid_request",
@@ -626,7 +671,7 @@ async fn discard_draft(
     let result =
         sqlx::query("DELETE FROM recipe_drafts WHERE id=? AND owner_token_hash=? AND revision=?")
             .bind(id)
-            .bind(owner_id)
+            .bind(&caller.token_hash)
             .bind(revision.expected_revision)
             .execute(&state.pool)
             .await
@@ -637,17 +682,29 @@ async fn discard_draft(
             "Draft not found or revision changed",
         ));
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
-async fn publish_draft(
+async fn api_publish_draft(
     State(state): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
     request: Result<Json<DraftRevision>, JsonRejection>,
 ) -> Result<(StatusCode, Json<SaveResult>), ApiError> {
-    let (author, owner_id) = authorize_identity(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
     let Json(expected) = request?;
+    let result = publish_draft(&state, &caller, &id, expected).await?;
+    Ok((StatusCode::OK, Json(result)))
+}
+
+async fn publish_draft(
+    state: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+    expected: DraftRevision,
+) -> Result<SaveResult, ApiError> {
+    let owner_id = &caller.token_hash;
+    let author = &caller.label;
     if expected.expected_revision <= 0 {
         return Err(ApiError::new(
             "invalid_request",
@@ -660,8 +717,8 @@ async fn publish_draft(
     let locked = sqlx::query(
         "UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?",
     )
-    .bind(&id)
-    .bind(&owner_id)
+    .bind(id)
+    .bind(owner_id)
     .bind(expected.expected_revision)
     .execute(&mut *tx)
     .await
@@ -673,7 +730,7 @@ async fn publish_draft(
         ));
     }
     let row = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
-        .bind(&id).bind(&owner_id).fetch_optional(&mut *tx).await.map_err(internal_error)?
+        .bind(id).bind(owner_id).fetch_optional(&mut *tx).await.map_err(internal_error)?
         .ok_or_else(|| ApiError::new("not_found", "Draft not found"))?;
     if row.revision != expected.expected_revision {
         return Err(ApiError::new("conflict", "The draft changed"));
@@ -715,8 +772,8 @@ async fn publish_draft(
             "SELECT 1 FROM draft_cover_candidates WHERE image_ref=? AND draft_id=? AND owner_token_hash=? AND draft_revision=?",
         )
         .bind(reference)
-        .bind(&id)
-        .bind(&owner_id)
+        .bind(id)
+        .bind(owner_id)
         .bind(expected.expected_revision)
         .fetch_optional(&mut *tx)
         .await
@@ -777,7 +834,7 @@ async fn publish_draft(
         &revision_id,
         &recipe_id,
         &now(),
-        &author,
+        author,
         &write,
         false,
         image_ref.as_deref(),
@@ -790,10 +847,10 @@ async fn publish_draft(
             .await
             .map_err(internal_error)?;
     }
-    derive_revision(&mut tx, &revision_id, &write.body, &author).await?;
+    derive_revision(&mut tx, &revision_id, &write.body, author).await?;
     sqlx::query("DELETE FROM recipe_drafts WHERE id=? AND owner_token_hash=? AND revision=?")
-        .bind(&id)
-        .bind(&owner_id)
+        .bind(id)
+        .bind(owner_id)
         .bind(expected.expected_revision)
         .execute(&mut *tx)
         .await
@@ -802,7 +859,7 @@ async fn publish_draft(
     let recipe = fetch_revision(&state.pool, &recipe_id, &revision_id)
         .await?
         .document();
-    Ok((StatusCode::OK, Json(SaveResult { recipe, warnings })))
+    Ok(SaveResult { recipe, warnings })
 }
 
 async fn create_recipe(
@@ -915,9 +972,9 @@ async fn delete_recipe(
     headers: HeaderMap,
     request: Result<Json<BaseRevision>, JsonRejection>,
 ) -> Result<Json<RecipeDocument>, ApiError> {
-    let author = authorize(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
     let Json(request) = request?;
-    append_state_revision(&state, &id, &request.base_revision, &author, true, None)
+    append_state_revision(&state, &caller, &id, &request.base_revision, true, None)
         .await
         .map(Json)
 }
@@ -933,9 +990,9 @@ async fn restore_recipe(
     headers: HeaderMap,
     request: Result<Json<BaseRevision>, JsonRejection>,
 ) -> Result<Json<RecipeDocument>, ApiError> {
-    let author = authorize(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
     let Json(request) = request?;
-    append_state_revision(&state, &id, &request.base_revision, &author, false, None)
+    append_state_revision(&state, &caller, &id, &request.base_revision, false, None)
         .await
         .map(Json)
 }
@@ -946,15 +1003,15 @@ async fn restore_revision(
     headers: HeaderMap,
     request: Result<Json<BaseRevision>, JsonRejection>,
 ) -> Result<Json<RecipeDocument>, ApiError> {
-    let author = authorize(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
     let Json(request) = request?;
     append_state_revision(
         &state,
+        &caller,
         &id,
         &request.base_revision,
-        &author,
         false,
-        Some(revision),
+        Some(&revision),
     )
     .await
     .map(Json)
@@ -962,14 +1019,15 @@ async fn restore_revision(
 
 async fn append_state_revision(
     state: &RecipeService,
+    caller: &CallerIdentity,
     id: &str,
     base: &str,
-    author: &str,
     deleted: bool,
-    restore: Option<String>,
+    restore: Option<&str>,
 ) -> Result<RecipeDocument, ApiError> {
+    let author = &caller.label;
     let source = if let Some(revision) = restore {
-        fetch_revision(&state.pool, id, &revision).await?
+        fetch_revision(&state.pool, id, revision).await?
     } else {
         fetch_current(&state.pool, id).await?
     };
@@ -1021,27 +1079,35 @@ async fn append_state_revision(
         .document())
 }
 
-async fn list_recipes(
+async fn api_list_recipes(
     State(state): State<RecipeService>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<RecipeDocument>>, ApiError> {
     authorize(&state, &headers).await?;
+    list_recipes(&state).await.map(Json)
+}
+
+async fn list_recipes(state: &RecipeService) -> Result<Vec<RecipeDocument>, ApiError> {
     let query = format!("SELECT {REVISION_COLUMNS} FROM recipe_revisions r JOIN recipes p ON p.current_revision_id = r.id WHERE p.deleted = 0 ORDER BY r.title COLLATE NOCASE");
     let rows = sqlx::query_as::<_, RevisionRow>(&query)
         .fetch_all(&state.pool)
         .await
         .map_err(internal_error)?;
-    Ok(Json(rows.into_iter().map(RevisionRow::document).collect()))
+    Ok(rows.into_iter().map(RevisionRow::document).collect())
 }
 
-async fn get_recipe(
+async fn api_get_recipe(
     State(state): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<RecipeDocument>, ApiError> {
     authorize(&state, &headers).await?;
-    let row = fetch_current(&state.pool, &id).await?;
-    Ok(Json(row.document()))
+    get_recipe(&state, &id).await.map(Json)
+}
+
+async fn get_recipe(state: &RecipeService, id: &str) -> Result<RecipeDocument, ApiError> {
+    let row = fetch_current(&state.pool, id).await?;
+    Ok(row.document())
 }
 
 #[derive(Deserialize)]
@@ -1457,13 +1523,20 @@ struct ValidationRequest {
     image_ref: Option<String>,
 }
 
-async fn validate_recipe(
+async fn api_validate_recipe(
     State(state): State<RecipeService>,
     headers: HeaderMap,
     request: Result<Json<ValidationRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers).await?;
     let Json(request) = request?;
+    validate_recipe(&state, request).await.map(Json)
+}
+
+async fn validate_recipe(
+    state: &RecipeService,
+    request: ValidationRequest,
+) -> Result<serde_json::Value, ApiError> {
     let warnings = state.parse_body(&request.body)?;
     let write = RecipeWrite {
         title: request.title.clone(),
@@ -1517,7 +1590,7 @@ async fn validate_recipe(
         deleted: 0,
         image_ref: request.image_ref,
     };
-    let view = scaled_view(&state, &row, target)?;
+    let view = scaled_view(state, &row, target)?;
     let parsed = view
         .ingredients
         .iter()
@@ -1543,7 +1616,7 @@ async fn validate_recipe(
         Err(pdf::RenderError::DoesNotFit { .. }) => (false, None, "does_not_fit"),
         Err(pdf::RenderError::Compile(message)) => return Err(internal_error(message)),
     };
-    Ok(Json(serde_json::json!({
+    Ok(serde_json::json!({
         "ingredients": parsed,
         "resolutions": resolutions,
         "warnings": warnings,
@@ -1553,7 +1626,7 @@ async fn validate_recipe(
             "status": status,
             "minimum_font_size_pt": 8
         }
-    })))
+    }))
 }
 
 fn escape_html(value: &str) -> String {
@@ -1877,36 +1950,46 @@ async fn public_rows(state: &RecipeService) -> Result<Vec<RevisionRow>, ApiError
         .fetch_all(&state.pool).await.map_err(internal_error)
 }
 
-async fn list_revisions(
+async fn api_list_revisions(
     State(state): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<RecipeDocument>>, ApiError> {
     authorize(&state, &headers).await?;
+    list_revisions(&state, &id).await.map(Json)
+}
+
+async fn list_revisions(state: &RecipeService, id: &str) -> Result<Vec<RecipeDocument>, ApiError> {
     let query = format!("SELECT {REVISION_COLUMNS} FROM recipe_revisions r WHERE r.recipe_id = ? ORDER BY r.created_at, r.id");
     let rows = sqlx::query_as::<_, RevisionRow>(&query)
-        .bind(&id)
+        .bind(id)
         .fetch_all(&state.pool)
         .await
         .map_err(internal_error)?;
     if rows.is_empty() {
         return Err(ApiError::new("not_found", "Recipe not found"));
     }
-    Ok(Json(rows.into_iter().map(RevisionRow::document).collect()))
+    Ok(rows.into_iter().map(RevisionRow::document).collect())
 }
 
-async fn get_revision(
+async fn api_get_revision(
     State(state): State<RecipeService>,
     Path((id, revision)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<RecipeDocument>, ApiError> {
     authorize(&state, &headers).await?;
-    Ok(Json(
-        fetch_revision(&state.pool, &id, &revision)
-            .await?
-            .document(),
-    ))
+    get_revision(&state, &id, &revision).await.map(Json)
 }
+
+async fn get_revision(
+    state: &RecipeService,
+    id: &str,
+    revision: &str,
+) -> Result<RecipeDocument, ApiError> {
+    Ok(fetch_revision(&state.pool, id, revision).await?.document())
+}
+
+const RECIPE_GUIDELINES: &str = include_str!("../guidelines/recipe-writing.md");
 
 async fn guidelines(
     State(state): State<RecipeService>,
@@ -1918,7 +2001,7 @@ async fn guidelines(
             axum::http::header::CONTENT_TYPE,
             "text/markdown; charset=utf-8",
         )],
-        include_str!("../guidelines/recipe-writing.md"),
+        RECIPE_GUIDELINES,
     ))
 }
 
@@ -1955,14 +2038,25 @@ struct GenerateRecipeCover {
     replace: bool,
 }
 
-async fn generate_draft_cover(
+async fn api_generate_draft_cover(
     State(state): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
     request: Result<Json<GenerateDraftCover>, JsonRejection>,
 ) -> Result<(StatusCode, Json<DraftCoverCandidate>), ApiError> {
-    let (_, owner) = authorize_identity(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
     let Json(request) = request?;
+    let result = generate_draft_cover(&state, &caller, &id, request).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+async fn generate_draft_cover(
+    state: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+    request: GenerateDraftCover,
+) -> Result<DraftCoverCandidate, ApiError> {
+    let owner = &caller.token_hash;
     if request.expected_revision <= 0 {
         return Err(ApiError::new(
             "invalid_request",
@@ -1975,8 +2069,8 @@ async fn generate_draft_cover(
         .ok_or_else(|| ApiError::new("invalid_request", "Cover generation is not configured"))?;
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT revision FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
-            .bind(&id)
-            .bind(&owner)
+            .bind(id)
+            .bind(owner)
             .fetch_optional(&state.pool)
             .await
             .map_err(internal_error)?;
@@ -2000,7 +2094,7 @@ async fn generate_draft_cover(
     // survives either a failed file write or a later candidate-row failure.
     let mut tx = state.pool.begin().await.map_err(internal_error)?;
     let locked = sqlx::query("UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?")
-        .bind(&id).bind(&owner).bind(request.expected_revision).execute(&mut *tx).await.map_err(internal_error)?;
+        .bind(id).bind(owner).bind(request.expected_revision).execute(&mut *tx).await.map_err(internal_error)?;
     if locked.rows_affected() == 0 {
         return Err(ApiError::new(
             "conflict",
@@ -2020,7 +2114,7 @@ async fn generate_draft_cover(
     // Recheck after I/O; a changed/deleted draft leaves only a guarded orphan.
     let mut tx = state.pool.begin().await.map_err(internal_error)?;
     let locked = sqlx::query("UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?")
-        .bind(&id).bind(&owner).bind(request.expected_revision).execute(&mut *tx).await.map_err(internal_error)?;
+        .bind(id).bind(owner).bind(request.expected_revision).execute(&mut *tx).await.map_err(internal_error)?;
     if locked.rows_affected() == 0 {
         return Err(ApiError::new(
             "conflict",
@@ -2028,27 +2122,42 @@ async fn generate_draft_cover(
         ));
     }
     sqlx::query("INSERT INTO draft_cover_candidates(image_ref,draft_id,owner_token_hash,draft_revision,created_at) VALUES(?,?,?,?,?)")
-        .bind(&reference).bind(&id).bind(&owner).bind(request.expected_revision).bind(now())
+        .bind(&reference).bind(id).bind(owner).bind(request.expected_revision).bind(now())
         .execute(&mut *tx).await.map_err(internal_error)?;
     tx.commit().await.map_err(internal_error)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(DraftCoverCandidate {
-            image_ref: reference.clone(),
-            preview_url: format!("/api/v1/drafts/{id}/covers/{reference}"),
-        }),
-    ))
+    Ok(DraftCoverCandidate {
+        image_ref: reference.clone(),
+        preview_url: format!("/api/v1/drafts/{id}/covers/{reference}"),
+    })
 }
 
-async fn get_draft_cover(
+async fn api_get_draft_cover(
     State(state): State<RecipeService>,
     Path((id, reference)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let (_, owner) = authorize_identity(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
+    let bytes = get_draft_cover(&state, &caller, &id, &reference).await?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, GENERATED_COVER_MIME),
+            (axum::http::header::CACHE_CONTROL, "private, no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+async fn get_draft_cover(
+    state: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+    reference: &str,
+) -> Result<Vec<u8>, ApiError> {
+    let owner = &caller.token_hash;
     let row: Option<(String, i64)> = sqlx::query_as(
         "SELECT owner_token_hash,draft_revision FROM draft_cover_candidates WHERE image_ref=? AND draft_id=?",
-    ).bind(&reference).bind(&id).fetch_optional(&state.pool).await.map_err(internal_error)?;
+    ).bind(reference).bind(id).fetch_optional(&state.pool).await.map_err(internal_error)?;
     let Some((candidate_owner, candidate_revision)) = row else {
         return Err(ApiError::new(
             "not_found",
@@ -2057,34 +2166,51 @@ async fn get_draft_cover(
     };
     let current_revision: Option<i64> =
         sqlx::query_scalar("SELECT revision FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
-            .bind(&id)
-            .bind(&owner)
+            .bind(id)
+            .bind(owner)
             .fetch_optional(&state.pool)
             .await
             .map_err(internal_error)?;
-    if candidate_owner != owner || current_revision != Some(candidate_revision) {
+    if candidate_owner != *owner || current_revision != Some(candidate_revision) {
         return Err(ApiError::new(
             "not_found",
             "Draft cover candidate not found",
         ));
     }
-    private_image_response(&state, &reference)
+    state.images.get(reference).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            ApiError::new("not_found", "Image not found")
+        } else {
+            internal_error(error)
+        }
+    })
 }
 
-async fn generate_recipe_cover(
+async fn api_generate_recipe_cover(
     State(state): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
     request: Result<Json<GenerateRecipeCover>, JsonRejection>,
 ) -> Result<Json<RecipeDocument>, ApiError> {
-    let author = authorize(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
     let Json(request) = request?;
+    generate_recipe_cover(&state, &caller, &id, request)
+        .await
+        .map(Json)
+}
+
+async fn generate_recipe_cover(
+    state: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+    request: GenerateRecipeCover,
+) -> Result<RecipeDocument, ApiError> {
     let generator = state
         .cover_generator
         .as_ref()
         .ok_or_else(|| ApiError::new("invalid_request", "Cover generation is not configured"))?;
-    let current = fetch_revision(&state.pool, &id, &request.base_revision).await?;
-    ensure_current_base(&state.pool, &id, &request.base_revision).await?;
+    let current = fetch_revision(&state.pool, id, &request.base_revision).await?;
+    ensure_current_base(&state.pool, id, &request.base_revision).await?;
     if current.image_ref.is_some() && !request.replace {
         return Err(ApiError::new(
             "conflict",
@@ -2109,36 +2235,10 @@ async fn generate_recipe_cover(
         .images
         .put(&reference, &safe)
         .map_err(internal_error)?;
-    append_image_revision(
-        &state,
-        &id,
-        &request.base_revision,
-        Some(&reference),
-        &author,
-    )
-    .await
-    .map(Json)
+    append_image_revision(state, caller, id, &request.base_revision, Some(&reference)).await
 }
 
-fn private_image_response(state: &RecipeService, reference: &str) -> Result<Response, ApiError> {
-    let bytes = state.images.get(reference).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            ApiError::new("not_found", "Image not found")
-        } else {
-            internal_error(error)
-        }
-    })?;
-    let mut response = bytes.into_response();
-    response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("image/jpeg"),
-    );
-    response.headers_mut().insert(
-        axum::http::header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
-    Ok(response)
-}
+const GENERATED_COVER_MIME: &str = "image/jpeg";
 
 fn normalize_generated_image(bytes: Vec<u8>) -> Result<Vec<u8>, &'static str> {
     if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
@@ -2311,14 +2411,23 @@ struct AttachImage {
     image_ref: String,
 }
 
-async fn attach_image(
+async fn api_attach_image(
     State(state): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
     request: Result<Json<AttachImage>, JsonRejection>,
 ) -> Result<Json<RecipeDocument>, ApiError> {
-    let author = authorize(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
     let Json(request) = request?;
+    attach_image(&state, &caller, &id, request).await.map(Json)
+}
+
+async fn attach_image(
+    state: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+    request: AttachImage,
+) -> Result<RecipeDocument, ApiError> {
     if !request.image_ref.starts_with("img_")
         || !state
             .images
@@ -2337,14 +2446,13 @@ async fn attach_image(
         return Err(ApiError::new("not_found", "Image not found"));
     }
     append_image_revision(
-        &state,
-        &id,
+        state,
+        caller,
+        id,
         &request.base_revision,
         Some(&request.image_ref),
-        &author,
     )
     .await
-    .map(Json)
 }
 
 async fn detach_image(
@@ -2353,20 +2461,21 @@ async fn detach_image(
     headers: HeaderMap,
     request: Result<Json<BaseRevision>, JsonRejection>,
 ) -> Result<Json<RecipeDocument>, ApiError> {
-    let author = authorize(&state, &headers).await?;
+    let caller = authorize_identity(&state, &headers).await?;
     let Json(request) = request?;
-    append_image_revision(&state, &id, &request.base_revision, None, &author)
+    append_image_revision(&state, &caller, &id, &request.base_revision, None)
         .await
         .map(Json)
 }
 
 async fn append_image_revision(
     state: &RecipeService,
+    caller: &CallerIdentity,
     id: &str,
     base: &str,
     image_ref: Option<&str>,
-    author: &str,
 ) -> Result<RecipeDocument, ApiError> {
+    let author = &caller.label;
     ensure_current_base(&state.pool, id, base).await?;
     let source = fetch_revision(&state.pool, id, base).await?;
     let revision_id = new_id("rev");
@@ -2571,16 +2680,23 @@ struct IngredientQuery {
     q: Option<String>,
 }
 
-async fn list_ingredients(
+async fn api_list_ingredients(
     State(s): State<RecipeService>,
     headers: HeaderMap,
     Query(q): Query<IngredientQuery>,
 ) -> Result<Json<Vec<IngredientSummary>>, ApiError> {
     authorize(&s, &headers).await?;
+    list_ingredients(&s, q).await.map(Json)
+}
+
+async fn list_ingredients(
+    s: &RecipeService,
+    q: IngredientQuery,
+) -> Result<Vec<IngredientSummary>, ApiError> {
     let query = q.q.as_deref().map(normalize);
     let rows = sqlx::query_as::<_, IngredientSummary>("SELECT i.id, i.name, COUNT(DISTINCT CASE WHEN p.deleted = 0 THEN p.id END) AS usage_count FROM ingredients i LEFT JOIN ingredient_occurrences o ON o.ingredient_id = COALESCE(i.redirect_to, i.id) LEFT JOIN recipe_revisions r ON r.id = o.revision_id LEFT JOIN recipes p ON p.current_revision_id = r.id WHERE i.deleted = 0 AND (? IS NULL OR i.normalized_name LIKE '%' || ? || '%') GROUP BY i.id ORDER BY i.name COLLATE NOCASE")
         .bind(&query).bind(&query).fetch_all(&s.pool).await.map_err(internal_error)?;
-    Ok(Json(rows))
+    Ok(rows)
 }
 
 #[derive(Serialize, FromRow)]
@@ -2590,19 +2706,23 @@ struct IngredientDetail {
     usage_count: i64,
 }
 
-async fn get_ingredient(
+async fn api_get_ingredient(
     State(s): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&s, &headers).await?;
+    get_ingredient(&s, &id).await.map(Json)
+}
+
+async fn get_ingredient(s: &RecipeService, id: &str) -> Result<serde_json::Value, ApiError> {
     let row = sqlx::query_as::<_, IngredientDetail>("SELECT i.id, i.name, COUNT(DISTINCT p.id) AS usage_count FROM ingredients i LEFT JOIN ingredient_occurrences o ON o.ingredient_id = COALESCE(i.redirect_to, i.id) LEFT JOIN recipe_revisions r ON r.id = o.revision_id LEFT JOIN recipes p ON p.current_revision_id = r.id AND p.deleted = 0 WHERE i.id = ? AND i.deleted = 0 GROUP BY i.id")
-        .bind(&id).fetch_optional(&s.pool).await.map_err(internal_error)?.ok_or_else(|| ApiError::new("not_found", "Ingredient not found"))?;
-    let aliases: Vec<String> = sqlx::query_scalar("SELECT alias FROM ingredient_aliases WHERE ingredient_id = ? ORDER BY alias COLLATE NOCASE").bind(&id).fetch_all(&s.pool).await.map_err(internal_error)?;
-    let recipes: Vec<String> = sqlx::query_scalar("SELECT DISTINCT p.id FROM ingredient_occurrences o JOIN recipe_revisions r ON r.id=o.revision_id JOIN recipes p ON p.current_revision_id=r.id WHERE o.ingredient_id=? AND p.deleted=0 ORDER BY p.id").bind(&id).fetch_all(&s.pool).await.map_err(internal_error)?;
-    Ok(Json(
+        .bind(id).fetch_optional(&s.pool).await.map_err(internal_error)?.ok_or_else(|| ApiError::new("not_found", "Ingredient not found"))?;
+    let aliases: Vec<String> = sqlx::query_scalar("SELECT alias FROM ingredient_aliases WHERE ingredient_id = ? ORDER BY alias COLLATE NOCASE").bind(id).fetch_all(&s.pool).await.map_err(internal_error)?;
+    let recipes: Vec<String> = sqlx::query_scalar("SELECT DISTINCT p.id FROM ingredient_occurrences o JOIN recipe_revisions r ON r.id=o.revision_id JOIN recipes p ON p.current_revision_id=r.id WHERE o.ingredient_id=? AND p.deleted=0 ORDER BY p.id").bind(id).fetch_all(&s.pool).await.map_err(internal_error)?;
+    Ok(
         serde_json::json!({"id":row.id,"name":row.name,"usage_count":row.usage_count,"aliases":aliases,"recipe_ids":recipes}),
-    ))
+    )
 }
 
 #[derive(Deserialize)]
@@ -2618,21 +2738,31 @@ struct MergeBody {
     survivor: String,
 }
 
-async fn rename_ingredient(
+async fn api_rename_ingredient(
     State(s): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
     request: Result<Json<NameBody>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let author = authorize(&s, &headers).await?;
+    let caller = authorize_identity(&s, &headers).await?;
     let Json(b) = request?;
+    rename_ingredient(&s, &caller, &id, b).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn rename_ingredient(
+    s: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+    b: NameBody,
+) -> Result<(), ApiError> {
     let name = b.name.trim();
     let normalized = normalize(name);
     if normalized.is_empty() {
         return Err(ApiError::new("invalid_request", "name must not be empty"));
     }
     let mut tx = s.pool.begin().await.map_err(internal_error)?;
-    let collision: Option<String>=sqlx::query_scalar("SELECT id FROM ingredients WHERE normalized_name=? AND id<>? UNION SELECT ingredient_id FROM ingredient_aliases WHERE normalized_alias=?").bind(&normalized).bind(&id).bind(&normalized).fetch_optional(&mut *tx).await.map_err(internal_error)?;
+    let collision: Option<String>=sqlx::query_scalar("SELECT id FROM ingredients WHERE normalized_name=? AND id<>? UNION SELECT ingredient_id FROM ingredient_aliases WHERE normalized_alias=?").bind(&normalized).bind(id).bind(&normalized).fetch_optional(&mut *tx).await.map_err(internal_error)?;
     if collision.is_some() {
         return Err(ApiError::new(
             "conflict",
@@ -2641,7 +2771,7 @@ async fn rename_ingredient(
     }
     let old: Option<String> =
         sqlx::query_scalar("SELECT name FROM ingredients WHERE id=? AND deleted=0")
-            .bind(&id)
+            .bind(id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(internal_error)?;
@@ -2649,30 +2779,40 @@ async fn rename_ingredient(
     sqlx::query("UPDATE ingredients SET name=?, normalized_name=? WHERE id=?")
         .bind(name)
         .bind(&normalized)
-        .bind(&id)
+        .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
-    sqlx::query("INSERT INTO ingredient_aliases(normalized_alias,alias,ingredient_id) VALUES(?,?,?) ON CONFLICT(normalized_alias) DO UPDATE SET alias=excluded.alias, ingredient_id=excluded.ingredient_id").bind(normalize(&old)).bind(&old).bind(&id).execute(&mut *tx).await.map_err(internal_error)?;
-    history(&mut tx, &id, "rename", name, "{}", &author).await?;
+    sqlx::query("INSERT INTO ingredient_aliases(normalized_alias,alias,ingredient_id) VALUES(?,?,?) ON CONFLICT(normalized_alias) DO UPDATE SET alias=excluded.alias, ingredient_id=excluded.ingredient_id").bind(normalize(&old)).bind(&old).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
+    history(&mut tx, id, "rename", name, "{}", &caller.label).await?;
     tx.commit().await.map_err(internal_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
-async fn add_alias(
+async fn api_add_alias(
     State(s): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
     request: Result<Json<AliasBody>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let author = authorize(&s, &headers).await?;
+    let caller = authorize_identity(&s, &headers).await?;
     let Json(b) = request?;
+    add_alias(&s, &caller, &id, b).await?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn add_alias(
+    s: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+    b: AliasBody,
+) -> Result<(), ApiError> {
     let alias = b.alias.trim();
     let normalized = normalize(alias);
     let mut tx = s.pool.begin().await.map_err(internal_error)?;
     let exists: Option<String> =
         sqlx::query_scalar("SELECT id FROM ingredients WHERE id=? AND deleted=0")
-            .bind(&id)
+            .bind(id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(internal_error)?;
@@ -2691,50 +2831,70 @@ async fn add_alias(
     )
     .bind(&normalized)
     .bind(alias)
-    .bind(&id)
+    .bind(id)
     .execute(&mut *tx)
     .await
     .map_err(internal_error)?;
-    history(&mut tx, &id, "alias_added", alias, "{}", &author).await?;
+    history(&mut tx, id, "alias_added", alias, "{}", &caller.label).await?;
     tx.commit().await.map_err(internal_error)?;
-    Ok(StatusCode::CREATED)
+    Ok(())
 }
 
-async fn remove_alias(
+async fn api_remove_alias(
     State(s): State<RecipeService>,
     Path((id, alias)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let author = authorize(&s, &headers).await?;
+    let caller = authorize_identity(&s, &headers).await?;
+    remove_alias(&s, &caller, &id, &alias).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_alias(
+    s: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+    alias: &str,
+) -> Result<(), ApiError> {
     let mut tx = s.pool.begin().await.map_err(internal_error)?;
     let result =
         sqlx::query("DELETE FROM ingredient_aliases WHERE normalized_alias=? AND ingredient_id=?")
-            .bind(normalize(&alias))
-            .bind(&id)
+            .bind(normalize(alias))
+            .bind(id)
             .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
     if result.rows_affected() == 0 {
         return Err(ApiError::new("not_found", "Alias not found"));
     }
-    history(&mut tx, &id, "alias_removed", &alias, "{}", &author).await?;
+    history(&mut tx, id, "alias_removed", alias, "{}", &caller.label).await?;
     tx.commit().await.map_err(internal_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
-async fn merge_ingredient(
+async fn api_merge_ingredient(
     State(s): State<RecipeService>,
     Path(id): Path<String>,
     headers: HeaderMap,
     request: Result<Json<MergeBody>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let author = authorize(&s, &headers).await?;
+    let caller = authorize_identity(&s, &headers).await?;
     let Json(b) = request?;
+    merge_ingredient(&s, &caller, &id, b).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn merge_ingredient(
+    s: &RecipeService,
+    caller: &CallerIdentity,
+    id: &str,
+    b: MergeBody,
+) -> Result<(), ApiError> {
     let survivor = normalize(&b.survivor);
     let mut tx = s.pool.begin().await.map_err(internal_error)?;
     let source: Option<String> =
         sqlx::query_scalar("SELECT name FROM ingredients WHERE id=? AND deleted=0")
-            .bind(&id)
+            .bind(id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(internal_error)?;
@@ -2760,19 +2920,19 @@ async fn merge_ingredient(
     // subsequent merges without relying on aliases or recursive joins.
     sqlx::query("UPDATE ingredients SET redirect_to=? WHERE redirect_to=?")
         .bind(&target)
-        .bind(&id)
+        .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
     sqlx::query("UPDATE ingredient_occurrences SET ingredient_id=? WHERE ingredient_id=?")
         .bind(&target)
-        .bind(&id)
+        .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
     sqlx::query("UPDATE ingredient_aliases SET ingredient_id=? WHERE ingredient_id=?")
         .bind(&target)
-        .bind(&id)
+        .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
@@ -2780,23 +2940,23 @@ async fn merge_ingredient(
         "UPDATE ingredient_resolution_provenance SET ingredient_id=? WHERE ingredient_id=?",
     )
     .bind(&target)
-    .bind(&id)
+    .bind(id)
     .execute(&mut *tx)
     .await
     .map_err(internal_error)?;
     sqlx::query("UPDATE ingredients SET deleted=1, redirect_to=? WHERE id=?")
         .bind(&target)
-        .bind(&id)
+        .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
     history(
         &mut tx,
-        &id,
+        id,
         "merged",
         &source,
         &serde_json::json!({"survivor":target}).to_string(),
-        &author,
+        &caller.label,
     )
     .await?;
     history(
@@ -2805,11 +2965,11 @@ async fn merge_ingredient(
         "merge_received",
         &source,
         &serde_json::json!({"source":id}).to_string(),
-        &author,
+        &caller.label,
     )
     .await?;
     tx.commit().await.map_err(internal_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 async fn history(
@@ -2824,17 +2984,20 @@ async fn history(
     Ok(())
 }
 
-async fn list_tags(
+async fn api_list_tags(
     State(s): State<RecipeService>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     authorize(&s, &headers).await?;
+    list_tags(&s).await.map(Json)
+}
+
+async fn list_tags(s: &RecipeService) -> Result<Vec<serde_json::Value>, ApiError> {
     let rows:Vec<(String,i64)>=sqlx::query_as("SELECT j.value,COUNT(DISTINCT p.id) FROM recipes p JOIN recipe_revisions r ON r.id=p.current_revision_id JOIN json_each(r.tags) j WHERE p.deleted=0 GROUP BY j.value ORDER BY j.value COLLATE NOCASE").fetch_all(&s.pool).await.map_err(internal_error)?;
-    Ok(Json(
-        rows.into_iter()
-            .map(|(tag, count)| serde_json::json!({"tag":tag,"count":count}))
-            .collect(),
-    ))
+    Ok(rows
+        .into_iter()
+        .map(|(tag, count)| serde_json::json!({"tag":tag,"count":count}))
+        .collect())
 }
 
 #[derive(Deserialize, Default)]
@@ -2856,12 +3019,19 @@ struct SearchQuery {
     offset: Option<u32>,
 }
 
-async fn search_recipes(
+async fn api_search_recipes(
     State(s): State<RecipeService>,
     headers: HeaderMap,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     authorize(&s, &headers).await?;
+    search_recipes(&s, q).await.map(Json)
+}
+
+async fn search_recipes(
+    s: &RecipeService,
+    q: SearchQuery,
+) -> Result<Vec<serde_json::Value>, ApiError> {
     let rows:Vec<RevisionRow>=sqlx::query_as::<_,RevisionRow>(&format!("SELECT {REVISION_COLUMNS} FROM recipes p JOIN recipe_revisions r ON r.id=p.current_revision_id ORDER BY r.title COLLATE NOCASE")).fetch_all(&s.pool).await.map_err(internal_error)?;
     let names = |v: &Option<String>| {
         v.as_deref()
@@ -3039,7 +3209,7 @@ async fn search_recipes(
     let offset = q.offset.unwrap_or(0) as usize;
     let limit = q.limit.unwrap_or(50).min(200) as usize;
     let result=found.into_iter().skip(offset).take(limit).map(|(doc,linked,needle)|{let matched:Vec<String>=linked.into_iter().filter(|(id,word)|if has_requested_ingredients { want.contains(id) } else { !needle.is_empty() && normalize(word).contains(&normalize(&needle)) }).map(|(_,word)|word).collect();let snippet=doc.body.chars().take(180).collect::<String>();serde_json::json!({"id":doc.id,"title":doc.title,"tags":doc.tags,"matched_ingredients":matched,"snippet":snippet})}).collect();
-    Ok(Json(result))
+    Ok(result)
 }
 
 async fn resolve_ingredient_id(pool: &SqlitePool, value: &str) -> Result<Option<String>, ApiError> {

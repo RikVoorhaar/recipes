@@ -1,5 +1,5 @@
 [workspace]
-members = ["recipe-app", "recipe-mcp"]
+members = ["recipe-app"]
 resolver = "2"
 
 [workspace.package]

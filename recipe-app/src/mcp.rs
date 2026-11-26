@@ -35,7 +35,7 @@ macro_rules! define_tools {
 }
 
 define_tools! {
-    SearchRecipes => ("search_recipes", "Search recipes using the API structured filters in query.", ""),
+    SearchRecipes => ("search_recipes", "Search recipes using structured filters in query.", ""),
     ListRecipes => ("list_recipes", "List current recipes.", ""),
     GetRecipe => ("get_recipe", "Get a recipe by ID.", "id"),
     SaveDraft => ("save_draft", "Start or revise an owner-private draft. Existing drafts require id and expected_revision; use recipe_id to start an edit.", "document"),
@@ -125,7 +125,7 @@ fn tool_schema(tool: Tool, required: &[&str]) -> Value {
             "type":"object",
             "properties":{"query":{
                 "type":"object",
-                "description":"Optional API search filters; comma-separated list filters use strings.",
+                "description":"Optional search filters; comma-separated list filters use strings.",
                 "properties":search_filters,
                 "additionalProperties":false
             }},
@@ -437,7 +437,7 @@ async fn invoke_generate_cover(
         )
         .await
         .map_err(service_error)?;
-        // Look up the image with the same caller and draft, never via the preview URL.
+        // Look up the image with the same caller and draft for the inline preview.
         let image = get_draft_cover(service, caller, id, &candidate.image_ref)
             .await
             .map_err(|_| "could not retrieve authenticated cover preview")?;
@@ -555,8 +555,7 @@ fn negotiate_protocol(requested: Option<&Value>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{authorize_identity, configure_tokens, database, FileImageStorage};
-    use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
+    use crate::{authorize_secret, configure_tokens, database, FileImageStorage};
     use std::sync::Arc;
 
     async fn service(
@@ -581,9 +580,9 @@ mod tests {
     }
 
     async fn caller(service: &RecipeService, secret: &'static str) -> CallerIdentity {
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static(secret));
-        authorize_identity(service, &headers).await.unwrap()
+        authorize_secret(service, secret.strip_prefix("Bearer ").unwrap())
+            .await
+            .unwrap()
     }
 
     async fn rpc(

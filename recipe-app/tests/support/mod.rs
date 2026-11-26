@@ -13,6 +13,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 pub struct TestApp {
     _directory: TempDir,
     database_path: PathBuf,
+    content_dir: PathBuf,
     address: SocketAddr,
     server: JoinHandle<()>,
     pool: SqlitePool,
@@ -77,7 +78,7 @@ impl TestApp {
         let address = listener.local_addr().expect("local address");
         let app_pool = pool.clone();
         let storage =
-            injected_storage.unwrap_or_else(|| Arc::new(FileImageStorage::new(content_dir)));
+            injected_storage.unwrap_or_else(|| Arc::new(FileImageStorage::new(&content_dir)));
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -89,6 +90,7 @@ impl TestApp {
         Self {
             _directory: directory,
             database_path,
+            content_dir,
             address,
             server,
             pool,
@@ -107,6 +109,12 @@ impl TestApp {
 
     pub fn client(&self) -> reqwest::Client {
         reqwest::Client::new()
+    }
+
+    pub fn install_image_fixture(&self, reference: &str, bytes: &[u8]) {
+        FileImageStorage::new(&self.content_dir)
+            .put(reference, bytes)
+            .expect("install image fixture");
     }
 
     pub async fn migration_count(&self) -> i64 {
@@ -221,6 +229,7 @@ impl TestApp {
         let Self {
             _directory,
             database_path,
+            content_dir,
             address,
             server,
             pool: _,
@@ -232,7 +241,7 @@ impl TestApp {
         database::migrate(&pool).await.expect("rerun migrations");
         let listener = TcpListener::bind(address).await.expect("rebind listener");
         let app_pool = pool.clone();
-        let storage = Arc::new(FileImageStorage::new(_directory.path().join("content")));
+        let storage = Arc::new(FileImageStorage::new(&content_dir));
         let server = tokio::spawn(async move {
             axum::serve(listener, app_with_storage(app_pool, storage))
                 .await
@@ -241,6 +250,7 @@ impl TestApp {
         Self {
             _directory,
             database_path,
+            content_dir,
             address,
             server,
             pool,

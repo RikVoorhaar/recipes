@@ -287,6 +287,17 @@ async fn complete_workflow_for_both_headers_and_private_drafts() {
 async fn transport_security_and_protocol_errors() {
     let (_dir, url) = server().await;
     let client = reqwest::Client::new();
+    let malformed = client
+        .post(&url)
+        .bearer_auth("first")
+        .header("content-type", "application/json")
+        .body(r#"{"name":"incomplete""#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), 400);
+    let error: Value = malformed.json().await.unwrap();
+    assert_eq!(error["error"]["code"], -32700);
     let body = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
     assert_eq!(client.get(&url).send().await.unwrap().status(), 405);
     for req in [

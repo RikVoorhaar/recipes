@@ -1,26 +1,26 @@
+#[path = "support/mcp.rs"]
+mod mcp;
 #[allow(dead_code)]
 mod support;
 
 use serde_json::{json, Value};
 
-fn bearer(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    request.bearer_auth("test-secret")
-}
-
 async fn create(app: &support::TestApp, name: &str, title: &str) -> Value {
-    bearer(reqwest::Client::new().post(app.url("/api/v1/recipes")))
-        .json(&json!({
-            "title": title,
-            "servings": 2,
-            "tags": ["supper"],
-            "body": format!("@{name}{{100%g}}")
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
+    let client = app.client();
+    let base = app.url("");
+    let draft = mcp::tool(&client, &base, "test-secret", "save_draft", json!({
+        "document":{"title":title,"servings":2,"tags":["supper"],"body":format!("@{name}{{100%g}}")}
+    })).await;
+    mcp::tool(
+        &client,
+        &base,
+        "test-secret",
+        "publish_draft",
+        json!({
+            "id":draft["id"],"expected_revision":draft["revision"]
+        }),
+    )
+    .await
 }
 
 async fn create_document(
@@ -32,31 +32,65 @@ async fn create_document(
     tags: &[&str],
     body: &str,
 ) -> Value {
-    bearer(reqwest::Client::new().post(app.url("/api/v1/recipes")))
-        .json(&json!({
-            "title": title,
-            "description": description,
-            "notes": notes,
-            "servings": servings,
-            "tags": tags,
-            "body": body,
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
+    let client = app.client();
+    let base = app.url("");
+    let draft = mcp::tool(
+        &client,
+        &base,
+        "test-secret",
+        "save_draft",
+        json!({
+            "document":{"title":title,"description":description,"notes":notes,
+                "servings":servings,"tags":tags,"body":body}
+        }),
+    )
+    .await;
+    mcp::tool(
+        &client,
+        &base,
+        "test-secret",
+        "publish_draft",
+        json!({
+            "id":draft["id"],"expected_revision":draft["revision"]
+        }),
+    )
+    .await
 }
 
 async fn search(app: &support::TestApp, query: &str) -> Value {
-    bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/search?{query}"))))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
+    let url = reqwest::Url::parse(&format!("http://localhost/?{query}")).unwrap();
+    let filters: serde_json::Map<String, Value> = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let value = match key.as_ref() {
+                "min_servings" | "max_servings" | "limit" | "offset" => {
+                    json!(value.parse::<u64>().unwrap())
+                }
+                "has_image" | "include_deleted" => json!(value.parse::<bool>().unwrap()),
+                _ => json!(value.as_ref()),
+            };
+            (key.into_owned(), value)
+        })
+        .collect();
+    mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "search_recipes",
+        json!({"query":filters}),
+    )
+    .await
+}
+
+async fn call(app: &support::TestApp, name: &str, args: Value) -> Value {
+    mcp::call(&app.client(), &app.url(""), "test-secret", name, args).await
+}
+
+fn assert_tool_error(result: &Value, code: &str) {
+    assert_eq!(result["isError"], true);
+    let error: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(error["code"], code);
 }
 
 #[tokio::test]
@@ -64,13 +98,14 @@ async fn registry_alias_rename_merge_and_rebuild_keep_recipe_history_immutable()
     let app = support::TestApp::start().await;
     let tomato_recipe = create(&app, "tomato", "Tomato supper").await["recipe"].clone();
     let tomatoes_recipe = create(&app, "tomatoes", "Tomatoes supper").await["recipe"].clone();
-    let list: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/ingredients")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let list = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "list_ingredients",
+        json!({}),
+    )
+    .await;
     let tomato = list
         .as_array()
         .unwrap()
@@ -90,14 +125,14 @@ async fn registry_alias_rename_merge_and_rebuild_keep_recipe_history_immutable()
         .unwrap()
         .to_owned();
     assert_eq!(list.as_array().unwrap().len(), 2);
-    let tomato_detail: Value =
-        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/ingredients/{tomato}"))))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    let tomato_detail = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "get_ingredient",
+        json!({"id":tomato}),
+    )
+    .await;
     assert_eq!(tomato_detail["usage_count"], 1);
     assert_eq!(tomato_detail["recipe_ids"], json!([tomato_recipe["id"]]));
     assert_eq!(
@@ -112,30 +147,27 @@ async fn registry_alias_rename_merge_and_rebuild_keep_recipe_history_immutable()
     assert_eq!(before_merge.as_array().unwrap().len(), 1);
     assert_eq!(before_merge[0]["id"], tomatoes_recipe["id"]);
 
-    let added = bearer(
-        reqwest::Client::new().post(app.url(&format!("/api/v1/ingredients/{tomato}/aliases"))),
+    let added = call(
+        &app,
+        "add_ingredient_alias",
+        json!({"id":tomato,"alias":"  pomodoro  "}),
     )
-    .json(&json!({"alias":"  pomodoro  "}))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(added.status(), 201);
-    let alias_collision = bearer(
-        reqwest::Client::new().post(app.url(&format!("/api/v1/ingredients/{tomatoes}/aliases"))),
+    .await;
+    assert_ne!(added["isError"], true);
+    let alias_collision = call(
+        &app,
+        "add_ingredient_alias",
+        json!({"id":tomatoes,"alias":"pomodoro"}),
     )
-    .json(&json!({"alias":"pomodoro"}))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(alias_collision.status(), 409);
-    let canonical_collision = bearer(
-        reqwest::Client::new().post(app.url(&format!("/api/v1/ingredients/{tomato}/aliases"))),
+    .await;
+    assert_tool_error(&alias_collision, "conflict");
+    let canonical_collision = call(
+        &app,
+        "add_ingredient_alias",
+        json!({"id":tomato,"alias":"tomatoes"}),
     )
-    .json(&json!({"alias":"tomatoes"}))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(canonical_collision.status(), 409);
+    .await;
+    assert_tool_error(&canonical_collision, "conflict");
     assert_eq!(
         search(&app, "ingredients=pomodoro")
             .await
@@ -145,35 +177,33 @@ async fn registry_alias_rename_merge_and_rebuild_keep_recipe_history_immutable()
         1
     );
 
-    let removed = bearer(
-        reqwest::Client::new()
-            .delete(app.url(&format!("/api/v1/ingredients/{tomato}/aliases/pomodoro"))),
+    let removed = call(
+        &app,
+        "remove_ingredient_alias",
+        json!({"id":tomato,"alias":"pomodoro"}),
     )
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(removed.status(), 204);
+    .await;
+    assert_ne!(removed["isError"], true);
     assert!(search(&app, "ingredients=pomodoro")
         .await
         .as_array()
         .unwrap()
         .is_empty());
 
-    let renamed =
-        bearer(reqwest::Client::new().put(app.url(&format!("/api/v1/ingredients/{tomato}"))))
-            .json(&json!({"name":"red tomato"}))
-            .send()
-            .await
-            .unwrap();
-    assert_eq!(renamed.status(), 204);
-    let self_merge_by_name = bearer(
-        reqwest::Client::new().post(app.url(&format!("/api/v1/ingredients/{tomato}/merge"))),
+    let renamed = call(
+        &app,
+        "rename_ingredient",
+        json!({"id":tomato,"name":"red tomato"}),
     )
-    .json(&json!({"survivor":"RED TOMATO"}))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(self_merge_by_name.status(), 422);
+    .await;
+    assert_ne!(renamed["isError"], true);
+    let self_merge_by_name = call(
+        &app,
+        "merge_ingredients",
+        json!({"id":tomato,"survivor":"RED TOMATO"}),
+    )
+    .await;
+    assert_tool_error(&self_merge_by_name, "invalid_request");
     assert_eq!(
         search(&app, "ingredients=tomato")
             .await
@@ -191,24 +221,22 @@ async fn registry_alias_rename_merge_and_rebuild_keep_recipe_history_immutable()
         1
     );
 
-    let merged = bearer(
-        reqwest::Client::new().post(app.url(&format!("/api/v1/ingredients/{tomatoes}/merge"))),
+    let merged = call(
+        &app,
+        "merge_ingredients",
+        json!({"id":tomatoes,"survivor":tomato}),
     )
-    .json(&json!({"survivor":tomato}))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(merged.status(), 204);
+    .await;
+    assert_ne!(merged["isError"], true);
     assert_eq!(app.ingredient_history_count(&tomato).await, 5);
     assert_eq!(app.ingredient_history_count(&tomatoes).await, 2);
-    let removed_merge_alias = bearer(
-        reqwest::Client::new()
-            .delete(app.url(&format!("/api/v1/ingredients/{tomato}/aliases/tomatoes"))),
+    let removed_merge_alias = call(
+        &app,
+        "remove_ingredient_alias",
+        json!({"id":tomato,"alias":"tomatoes"}),
     )
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(removed_merge_alias.status(), 404);
+    .await;
+    assert_tool_error(&removed_merge_alias, "not_found");
     assert_eq!(
         search(&app, "ingredients=tomatoes")
             .await
@@ -217,13 +245,14 @@ async fn registry_alias_rename_merge_and_rebuild_keep_recipe_history_immutable()
             .len(),
         2
     );
-    let tag_counts: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/tags")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let tag_counts = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "list_tags",
+        json!({}),
+    )
+    .await;
     assert_eq!(tag_counts[0]["count"], 2);
 
     app.rebuild_derived().await;
@@ -235,16 +264,14 @@ async fn registry_alias_rename_merge_and_rebuild_keep_recipe_history_immutable()
             .len(),
         2
     );
-    let revision: Value = bearer(reqwest::Client::new().get(app.url(&format!(
-        "/api/v1/recipes/{}/revisions",
-        tomato_recipe["id"].as_str().unwrap()
-    ))))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
+    let revision = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "list_revisions",
+        json!({"id":tomato_recipe["id"]}),
+    )
+    .await;
     assert_eq!(revision.as_array().unwrap().len(), 1);
     assert_eq!(tomatoes_recipe["body"], "@tomatoes{100%g}");
 }
@@ -253,13 +280,14 @@ async fn registry_alias_rename_merge_and_rebuild_keep_recipe_history_immutable()
 async fn used_alias_provenance_survives_removal_and_rebuild_and_redirect_names_resolve() {
     let app = support::TestApp::start().await;
     let garlic = create(&app, "garlic", "Garlic prep").await["recipe"].clone();
-    let ingredients: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/ingredients")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let ingredients = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "list_ingredients",
+        json!({}),
+    )
+    .await;
     let garlic_id = ingredients
         .as_array()
         .unwrap()
@@ -270,28 +298,24 @@ async fn used_alias_provenance_survives_removal_and_rebuild_and_redirect_names_r
         .unwrap()
         .to_owned();
 
-    assert_eq!(
-        bearer(
-            reqwest::Client::new()
-                .post(app.url(&format!("/api/v1/ingredients/{garlic_id}/aliases")))
+    assert_ne!(
+        call(
+            &app,
+            "add_ingredient_alias",
+            json!({"id":garlic_id,"alias":"allium sativum"})
         )
-        .json(&json!({"alias":"allium sativum"}))
-        .send()
-        .await
-        .unwrap()
-        .status(),
-        201
+        .await["isError"],
+        true
     );
     let used = create(&app, "allium sativum", "Alias prep").await["recipe"].clone();
-    assert_eq!(
-        bearer(reqwest::Client::new().delete(app.url(&format!(
-            "/api/v1/ingredients/{garlic_id}/aliases/allium%20sativum"
-        ))))
-        .send()
-        .await
-        .unwrap()
-        .status(),
-        204
+    assert_ne!(
+        call(
+            &app,
+            "remove_ingredient_alias",
+            json!({"id":garlic_id,"alias":"allium sativum"})
+        )
+        .await["isError"],
+        true
     );
     app.rebuild_derived().await;
     let by_canonical = search(&app, &format!("ingredients={garlic_id}")).await;
@@ -319,42 +343,40 @@ async fn used_alias_provenance_survives_removal_and_rebuild_and_redirect_names_r
     );
 
     let source = create(&app, "chilli", "Chilli prep").await["recipe"].clone();
-    let chilli_id = bearer(reqwest::Client::new().get(app.url("/api/v1/ingredients")))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap()
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"] == "chilli")
-        .unwrap()["id"]
+    let chilli_id = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "list_ingredients",
+        json!({}),
+    )
+    .await
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|row| row["name"] == "chilli")
+    .unwrap()["id"]
         .as_str()
         .unwrap()
         .to_owned();
-    let merge = bearer(
-        reqwest::Client::new().post(app.url(&format!("/api/v1/ingredients/{chilli_id}/merge"))),
+    let merge = call(
+        &app,
+        "merge_ingredients",
+        json!({"id":chilli_id,"survivor":garlic_id}),
     )
-    .json(&json!({"survivor":garlic_id}))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(merge.status(), 204);
+    .await;
+    assert_ne!(merge["isError"], true);
     // Simulate a legacy merge-added alias: the redirect must outlive it.
     app.add_ingredient_alias_fixture("chilli", "chilli", &garlic_id)
         .await;
-    assert_eq!(
-        bearer(
-            reqwest::Client::new()
-                .delete(app.url(&format!("/api/v1/ingredients/{garlic_id}/aliases/chilli")))
+    assert_ne!(
+        call(
+            &app,
+            "remove_ingredient_alias",
+            json!({"id":garlic_id,"alias":"chilli"})
         )
-        .send()
-        .await
-        .unwrap()
-        .status(),
-        204
+        .await["isError"],
+        true
     );
     assert_eq!(
         search(&app, "ingredients=chilli&sort=title")
@@ -378,14 +400,13 @@ async fn used_alias_provenance_survives_removal_and_rebuild_and_redirect_names_r
             .len(),
         3
     );
-    let self_merge_by_id = bearer(
-        reqwest::Client::new().post(app.url(&format!("/api/v1/ingredients/{garlic_id}/merge"))),
+    let self_merge_by_id = call(
+        &app,
+        "merge_ingredients",
+        json!({"id":garlic_id,"survivor":garlic_id}),
     )
-    .json(&json!({"survivor":garlic_id}))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(self_merge_by_id.status(), 422);
+    .await;
+    assert_tool_error(&self_merge_by_id, "invalid_request");
     app.rebuild_derived().await;
     assert_eq!(
         search(&app, &format!("ingredients={chilli_id}"))
@@ -403,13 +424,14 @@ async fn chained_merges_flatten_redirects_for_saves_search_counts_and_rebuild() 
     let recipe_a = create(&app, "ingredient a", "Recipe A").await["recipe"].clone();
     let recipe_b = create(&app, "ingredient b", "Recipe B").await["recipe"].clone();
     let recipe_c = create(&app, "ingredient c", "Recipe C").await["recipe"].clone();
-    let ids: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/ingredients")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let ids = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "list_ingredients",
+        json!({}),
+    )
+    .await;
     let ingredient_id = |name: &str| {
         ids.as_array()
             .unwrap()
@@ -424,14 +446,13 @@ async fn chained_merges_flatten_redirects_for_saves_search_counts_and_rebuild() 
     let b = ingredient_id("ingredient b");
     let c = ingredient_id("ingredient c");
     for (source, survivor) in [(&a, &b), (&b, &c)] {
-        let merged = bearer(
-            reqwest::Client::new().post(app.url(&format!("/api/v1/ingredients/{source}/merge"))),
+        let merged = call(
+            &app,
+            "merge_ingredients",
+            json!({"id":source,"survivor":survivor}),
         )
-        .json(&json!({"survivor":survivor}))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(merged.status(), 204);
+        .await;
+        assert_ne!(merged["isError"], true);
     }
 
     let recipe_after_merges =
@@ -444,14 +465,14 @@ async fn chained_merges_flatten_redirects_for_saves_search_counts_and_rebuild() 
             .len(),
         4
     );
-    let detail: Value =
-        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/ingredients/{c}"))))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    let detail = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "get_ingredient",
+        json!({"id":c}),
+    )
+    .await;
     assert_eq!(detail["usage_count"], 4);
     assert_eq!(detail["recipe_ids"].as_array().unwrap().len(), 4);
 
@@ -621,32 +642,33 @@ async fn structured_search_combines_filters_sorts_and_paginates_stably() {
         ]
     );
 
-    let deleted = bearer(reqwest::Client::new().delete(app.url(&format!(
-        "/api/v1/recipes/{}",
-        alpha["id"].as_str().unwrap()
-    ))))
-    .json(&json!({"base_revision":alpha["revision"]}))
-    .send()
-    .await
-    .unwrap()
-    .json::<Value>()
-    .await
-    .unwrap();
+    let deleted = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "delete_recipe",
+        json!({
+            "id":alpha["id"],"base_revision":alpha["revision"]
+        }),
+    )
+    .await;
     assert_eq!(deleted["deleted"], true);
     assert_eq!(ids(search(&app, "q=Alpha").await), Vec::<String>::new());
     assert_eq!(
         ids(search(&app, "q=Alpha&include_deleted=true").await),
         vec![alpha["id"].as_str().unwrap()]
     );
-    let restored = bearer(reqwest::Client::new().post(app.url(&format!(
-        "/api/v1/recipes/{}/restore",
-        alpha["id"].as_str().unwrap()
-    ))))
-    .json(&json!({"base_revision":deleted["revision"]}))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(restored.status(), 200);
+    let restored = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "restore_recipe",
+        json!({
+            "id":alpha["id"],"base_revision":deleted["revision"]
+        }),
+    )
+    .await;
+    assert_eq!(restored["deleted"], false);
     app.rebuild_derived().await;
     assert_eq!(
         ids(search(&app, "q=Alpha").await),
@@ -664,27 +686,33 @@ async fn ingredient_normalization_uses_unicode_default_case_folding() {
 }
 
 #[tokio::test]
-async fn ingredient_mutations_return_structured_json_rejection_errors() {
+async fn ingredient_mutations_reject_missing_arguments() {
     let app = support::TestApp::start().await;
     let recipe = create(&app, "salt", "Salt").await["recipe"].clone();
-    let ingredients: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/ingredients")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let ingredients = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "list_ingredients",
+        json!({}),
+    )
+    .await;
     let id = ingredients[0]["id"].as_str().unwrap();
-    let response =
-        bearer(reqwest::Client::new().put(app.url(&format!("/api/v1/ingredients/{id}"))))
-            .header("content-type", "application/json")
-            .body(r#"{"name":"incomplete""#)
-            .send()
-            .await
-            .unwrap();
-    assert_eq!(response.status(), 400);
-    let error: Value = response.json().await.unwrap();
-    assert_eq!(error["code"], "invalid_json");
+    let response = call(&app, "rename_ingredient", json!({"id":id})).await;
+    assert_eq!(response["isError"], true);
+    assert!(response["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("name"));
+    let detail = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "get_ingredient",
+        json!({"id":id}),
+    )
+    .await;
+    assert_eq!(detail["name"], "salt");
     assert_eq!(recipe["title"], "Salt");
 }
 
@@ -693,37 +721,43 @@ async fn delete_and_both_restore_paths_copy_saved_alias_resolution() {
     let app = support::TestApp::start().await;
     let created = create(&app, "oregano", "Herb recipe").await["recipe"].clone();
     let id = created["id"].as_str().unwrap();
-    let original_revision = created["revision"].as_str().unwrap();
-    let ingredients: Value = bearer(reqwest::Client::new().get(app.url("/api/v1/ingredients")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let oregano_id = ingredients[0]["id"].as_str().unwrap().to_owned();
-    let add_alias = bearer(
-        reqwest::Client::new().post(app.url(&format!("/api/v1/ingredients/{oregano_id}/aliases"))),
+    let ingredients = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "list_ingredients",
+        json!({}),
     )
-    .json(&json!({"alias":"wild marjoram"}))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(add_alias.status(), 201);
+    .await;
+    let oregano_id = ingredients[0]["id"].as_str().unwrap().to_owned();
+    let add_alias = call(
+        &app,
+        "add_ingredient_alias",
+        json!({"id":oregano_id,"alias":"wild marjoram"}),
+    )
+    .await;
+    assert_ne!(add_alias["isError"], true);
 
-    let updated = bearer(reqwest::Client::new().put(app.url(&format!("/api/v1/recipes/{id}"))))
-        .json(&json!({
-            "title":"Herb recipe",
-            "servings":2,
-            "body":"@wild marjoram{10%g}",
-            "base_revision":original_revision
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap()["recipe"]
+    let draft = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "save_draft",
+        json!({
+            "recipe_id":id,"document":{"body":"@wild marjoram{10%g}"}
+        }),
+    )
+    .await;
+    let updated = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "publish_draft",
+        json!({
+            "id":draft["id"],"expected_revision":draft["revision"]
+        }),
+    )
+    .await["recipe"]
         .clone();
     let alias_revision = updated["revision"].as_str().unwrap();
     assert_eq!(
@@ -734,45 +768,46 @@ async fn delete_and_both_restore_paths_copy_saved_alias_resolution() {
             .len(),
         1
     );
-    assert_eq!(
-        bearer(reqwest::Client::new().delete(app.url(&format!(
-            "/api/v1/ingredients/{oregano_id}/aliases/wild%20marjoram"
-        ))))
-        .send()
-        .await
-        .unwrap()
-        .status(),
-        204
+    assert_ne!(
+        call(
+            &app,
+            "remove_ingredient_alias",
+            json!({"id":oregano_id,"alias":"wild marjoram"})
+        )
+        .await["isError"],
+        true
     );
 
-    let deleted = bearer(reqwest::Client::new().delete(app.url(&format!("/api/v1/recipes/{id}"))))
-        .json(&json!({"base_revision":alias_revision}))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
-    let restored =
-        bearer(reqwest::Client::new().post(app.url(&format!("/api/v1/recipes/{id}/restore"))))
-            .json(&json!({"base_revision":deleted["revision"]}))
-            .send()
-            .await
-            .unwrap()
-            .json::<Value>()
-            .await
-            .unwrap();
-    let historical = bearer(
-        reqwest::Client::new()
-            .post(app.url(&format!("/api/v1/recipes/{id}/revisions/{alias_revision}"))),
+    let deleted = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "delete_recipe",
+        json!({
+            "id":id,"base_revision":alias_revision
+        }),
     )
-    .json(&json!({"base_revision":restored["revision"]}))
-    .send()
-    .await
-    .unwrap()
-    .json::<Value>()
-    .await
-    .unwrap();
+    .await;
+    let restored = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "restore_recipe",
+        json!({
+            "id":id,"base_revision":deleted["revision"]
+        }),
+    )
+    .await;
+    let historical = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "restore_revision",
+        json!({
+            "id":id,"revision":alias_revision,"base_revision":restored["revision"]
+        }),
+    )
+    .await;
     assert_eq!(historical["body"], "@wild marjoram{10%g}");
     app.rebuild_derived().await;
 
@@ -789,13 +824,13 @@ async fn delete_and_both_restore_paths_copy_saved_alias_resolution() {
         .as_array()
         .unwrap()
         .is_empty());
-    let history: Value =
-        bearer(reqwest::Client::new().get(app.url(&format!("/api/v1/recipes/{id}/revisions"))))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    let history = mcp::tool(
+        &app.client(),
+        &app.url(""),
+        "test-secret",
+        "list_revisions",
+        json!({"id":id}),
+    )
+    .await;
     assert_eq!(history.as_array().unwrap().len(), 5);
 }

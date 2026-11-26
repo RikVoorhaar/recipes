@@ -9,6 +9,8 @@ pub struct Settings {
     pub content_dir: PathBuf,
     #[serde(default)]
     pub api_tokens: Vec<String>,
+    #[serde(default)]
+    pub mcp_allowed_origins: Vec<String>,
     #[serde(default = "default_cover_model")]
     pub cover_model: String,
     #[serde(default)]
@@ -40,6 +42,18 @@ impl Settings {
             Err(std::env::VarError::NotPresent) => None,
             Err(std::env::VarError::NotUnicode(_)) => return Err(invalid_configuration().into()),
         };
+        let environment_origins = match std::env::var("APP__MCP_ALLOWED_ORIGINS") {
+            Ok(value) => Some(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            ),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => return Err(invalid_configuration().into()),
+        };
         let settings = Config::builder()
             .set_default("bind_addr", "127.0.0.1:3000")
             .map_err(|_| invalid_configuration())?
@@ -58,10 +72,26 @@ impl Settings {
         } else {
             settings
         };
-        let settings = settings.build().map_err(|_| invalid_configuration())?;
-        settings
+        let settings = if let Some(origins) = environment_origins {
+            settings
+                .set_override("mcp_allowed_origins", origins)
+                .map_err(|_| invalid_configuration())?
+        } else {
+            settings
+        };
+        let settings: Self = settings
+            .build()
+            .map_err(|_| invalid_configuration())?
             .try_deserialize()
-            .map_err(|_| invalid_configuration().into())
+            .map_err(|_| invalid_configuration())?;
+        if settings
+            .mcp_allowed_origins
+            .iter()
+            .any(|origin| !crate::mcp_http::valid_origin(origin))
+        {
+            return Err(invalid_configuration().into());
+        }
+        Ok(settings)
     }
 }
 

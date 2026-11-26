@@ -2,23 +2,39 @@
 
 ## OpenCode quickstart
 
-The stdio adapter has been removed. This setup will work once the HTTP MCP endpoint is deployed (see [#10](https://github.com/RikVoorhaar/recipes/issues/10)).
+The MCP endpoint uses Streamable HTTP; the stdio adapter has been removed.
+It supports the initialize-based protocol revisions through `2025-11-25`, not
+the current `2026-07-28` per-request-metadata protocol. Clients that support
+both eras must use their legacy mode or fallback.
 
 Merge this into `~/.config/opencode/opencode.json`:
 
 ```json
 {
   "mcp": {
-    "recipes": {
-      "type": "remote",
-      "url": "https://recipes.rikvoorhaar.com/mcp",
-      "headers": { "Authorization": "Bearer {file:~/.config/recipes.token}" }
+    "servers": {
+      "recipes": {
+        "type": "remote",
+        "url": "https://recipes.rikvoorhaar.com/mcp",
+        "oauth": false,
+        "headers": { "Authorization": "Bearer {file:~/.config/recipes.token}" }
+      }
     }
   }
 }
 ```
 
 Save your bearer **secret** (not `label:secret`) to `~/.config/recipes.token` on the OpenCode machine and set permissions with `chmod 600 ~/.config/recipes.token`. OpenCode reads it through [file substitution](https://opencode.ai/docs/config#variables). Keep it outside the repo; never put the secret in config, commands, prompts, or chat.
+
+For browser-based MCP clients, configure trusted origins explicitly using
+`mcp_allowed_origins = ["https://inspector.example"]` in `config.toml`, or
+`APP__MCP_ALLOWED_ORIGINS=https://inspector.example,http://localhost:6274`
+in the server environment (including an environment file or Compose
+`environment:`). Use exact origins without paths or trailing slashes. The
+default is empty: requests without Origin are accepted, but all browser origins
+are rejected until configured. Never derive this allowlist from Host.
+The example configuration explicitly trusts the recipe site's origin; replace
+that value when deploying elsewhere.
 
 Config reloads automatically; if needed run `/reload`. In that session, use `/mcps` and confirm `recipes` connects, then call `recipes_get_guidelines` through MCP. If MCP or the call is unavailable, stop and ask—do not create a file or bypass MCP.
 

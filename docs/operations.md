@@ -13,6 +13,14 @@ tokens in a root-readable environment file, never in source control or command
 arguments. The app logs JSON to stderr/stdout through tracing and does not log
 authorization headers or token values.
 
+`mcp_allowed_origins` is an array of explicitly trusted browser origins for
+`/mcp`; `APP__MCP_ALLOWED_ORIGINS` overrides it with a comma-separated list.
+Set the environment variable in the service's environment file or Compose
+`environment:` (for example `APP__MCP_ALLOWED_ORIGINS=http://localhost:6274`).
+Origins must be exact HTTP(S) origins without paths or trailing slashes. The
+empty default rejects every request carrying Origin; requests without Origin
+remain usable. Invalid configured origins prevent startup.
+
 Migrations run automatically on each application startup. Startup also runs
 the derived-data ensure step. To intentionally rebuild ingredient links and
 search-derived state, stop the service and invoke the binary with the service's

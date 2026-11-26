@@ -11,6 +11,47 @@ const SECOND_CONFIGURED_TOKEN: &str = "second-configured-token-secret-sentinel";
 const AUTHORIZATION_SENTINEL: &str = "authorization-header-secret-sentinel";
 
 #[tokio::test]
+async fn absent_origin_configuration_denies_origins_but_not_non_browser_requests() {
+    let directory = TempDir::new().unwrap();
+    let address = available_address();
+    let child = start_binary(
+        &directory.path().join("missing.toml"),
+        &directory.path().join("db.sqlite"),
+        &directory.path().join("content"),
+        address,
+        "owner:secret",
+    );
+    request_health(address).await;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"});
+    let url = format!("http://{address}/mcp");
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("secret")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("secret")
+            .header("origin", "https://recipes.rikvoorhaar.com")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    stop_and_capture(child);
+}
+
+#[tokio::test]
 async fn configured_browser_origins_are_enforced_by_the_binary() {
     let directory = TempDir::new().unwrap();
     let address = available_address();

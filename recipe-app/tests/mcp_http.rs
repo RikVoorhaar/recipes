@@ -195,6 +195,32 @@ async fn batching_depends_on_protocol_version_and_preserves_identity() {
 }
 
 #[tokio::test]
+async fn modern_protocol_is_not_advertised_or_accepted() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    let initialized = rpc(
+        &client,
+        &url,
+        "authorization",
+        "Bearer first",
+        "initialize",
+        json!({"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"test","version":"1"}}),
+    )
+    .await;
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    let response = client
+        .post(&url)
+        .bearer_auth("first")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "server/discover")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+}
+
+#[tokio::test]
 async fn complete_workflow_for_both_headers_and_private_drafts() {
     let (_dir, url) = server().await;
     let client = reqwest::Client::new();

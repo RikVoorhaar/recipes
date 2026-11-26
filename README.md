@@ -3,6 +3,9 @@
 ## OpenCode quickstart
 
 The MCP endpoint uses Streamable HTTP; the stdio adapter has been removed.
+It supports the initialize-based protocol revisions through `2025-11-25`, not
+the current `2026-07-28` per-request-metadata protocol. Clients that support
+both eras must use their legacy mode or fallback.
 
 Merge this into `~/.config/opencode/opencode.json`:
 
@@ -30,6 +33,8 @@ in the server environment (including an environment file or Compose
 `environment:`). Use exact origins without paths or trailing slashes. The
 default is empty: requests without Origin are accepted, but all browser origins
 are rejected until configured. Never derive this allowlist from Host.
+The example configuration explicitly trusts the recipe site's origin; replace
+that value when deploying elsewhere.
 
 Config reloads automatically; if needed run `/reload`. In that session, use `/mcps` and confirm `recipes` connects, then call `recipes_get_guidelines` through MCP. If MCP or the call is unavailable, stop and ask—do not create a file or bypass MCP.
 

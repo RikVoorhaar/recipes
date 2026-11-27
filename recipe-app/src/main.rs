@@ -2,7 +2,11 @@ use recipe_app::{
     app_with_public_base_url, config::Settings, cover::Generator, database,
     storage::FileImageStorage,
 };
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -16,6 +20,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let settings = Settings::load()?;
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        let mut address: SocketAddr = settings.bind_addr.parse()?;
+        if address.ip().is_unspecified() {
+            address.set_ip(match address.ip() {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            });
+        }
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()?
+            .get(format!("http://{address}/health"))
+            .send()
+            .await?
+            .error_for_status()?;
+        return Ok(());
+    }
     tokio::fs::create_dir_all(&settings.content_dir).await?;
     let pool = database::connect(&settings.database_path).await?;
     database::migrate(&pool).await?;

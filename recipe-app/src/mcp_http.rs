@@ -307,12 +307,23 @@ pub(crate) async fn post(
             .into_response();
         }
     }
+    let cacheable = modern
+        && matches!(
+            message["method"].as_str(),
+            Some("server/discover" | "tools/list" | "resources/list" | "resources/read")
+        );
     match mcp::handle(&state, &caller, message).await {
         Some(mut response) => {
             if modern {
                 if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
                     result.insert("resultType".into(), json!("complete"));
                     result.insert("_meta".into(), json!({"io.modelcontextprotocol/serverInfo":{"name":"recipe-mcp","version":"0.1.0"}}));
+                    if cacheable {
+                        // Restrict reuse to the same authorization context; freshness
+                        // expires immediately even for otherwise shared content.
+                        result.insert("ttlMs".into(), json!(0));
+                        result.insert("cacheScope".into(), json!("private"));
+                    }
                 }
                 if response["error"]["code"] == -32601 {
                     return (StatusCode::NOT_FOUND, Json(response)).into_response();

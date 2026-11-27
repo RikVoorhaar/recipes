@@ -47,6 +47,78 @@ async fn server() -> (tempfile::TempDir, String) {
 }
 
 #[tokio::test]
+async fn cache_hints_are_modern_only_and_only_on_cacheable_successes() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    for (method, name) in [
+        ("server/discover", None),
+        ("tools/list", None),
+        ("resources/list", None),
+        ("resources/read", Some("recipe://guidelines")),
+        ("tools/call", Some("get_guidelines")),
+        ("resources/read", Some("recipe://missing")),
+    ] {
+        let mut params = json!({"_meta":{
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities":{}
+        }});
+        if let Some(name) = name {
+            params[if method == "resources/read" {
+                "uri"
+            } else {
+                "name"
+            }] = json!(name);
+        }
+        let mut request = client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", method);
+        if let Some(name) = name {
+            request = request.header("mcp-name", name);
+        }
+        let response: Value = request
+            .json(&json!({
+                "jsonrpc":"2.0","id":1,"method":method,"params":params
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if method == "resources/read" && name == Some("recipe://missing") {
+            assert_eq!(response["error"]["code"], -32602);
+            assert!(response.get("result").is_none());
+        } else if method == "tools/call" {
+            assert!(response["result"].get("ttlMs").is_none());
+            assert!(response["result"].get("cacheScope").is_none());
+        } else {
+            assert_eq!(response["result"]["ttlMs"], 0);
+            assert_eq!(response["result"]["cacheScope"], "private");
+            assert!(response["result"]["_meta"].get("ttlMs").is_none());
+        }
+    }
+    for (method, params) in [
+        ("tools/list", json!({})),
+        ("resources/list", json!({})),
+        ("resources/read", json!({"uri":"recipe://guidelines"})),
+    ] {
+        let response = rpc(
+            &client,
+            &url,
+            "authorization",
+            "Bearer first",
+            method,
+            params,
+        )
+        .await;
+        assert!(response["result"].get("ttlMs").is_none());
+        assert!(response["result"].get("cacheScope").is_none());
+    }
+}
+
+#[tokio::test]
 async fn modern_batch_cannot_dispatch_through_legacy_version() {
     let (_dir, url) = server().await;
     let client = reqwest::Client::new();

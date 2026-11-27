@@ -16,23 +16,27 @@ every request, and `Mcp-Name` on tool calls and resource reads. Each request's
 version and `io.modelcontextprotocol/clientCapabilities` (an empty object is
 valid). `server/discover` reports supported revisions and capabilities;
 `tools/list` and `tools/call` can also be sent without a prior handshake.
-All requests still require authentication. Server tool input schemas use the
-default JSON Schema 2020-12 dialect.
+All requests still require authentication. Modern cacheable results include
+`ttlMs: 0` (immediately stale) and `cacheScope: "private"` (reuse only within
+the same authorization context); these hints do not replace access controls.
+See the [2026 caching specification](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching).
+Server tool input schemas use the default JSON Schema 2020-12 dialect.
 
 Local interoperability check: `scripts/mcp_2026_probe.py`
 (`python-stdlib-mcp-probe` 1.0, Python 3.12.3) explicitly used `2026-07-28`
 for discovery, tool listing, and a tool call against a loopback-only server.
-This hand-written probe is not an independently maintained MCP SDK or a live
-connector; those compatibility checks remain open.
+This hand-written probe is supplemental, not an independent MCP SDK or a live
+connector.
 
 Independent client check (2026-11-27): the released
 [official Python SDK `mcp==2.3.0`](https://pypi.org/project/mcp/2.3.0/),
 with `mcp-types==2.3.0` and Python 3.13.12, was run against a local loopback
-server with `mode="2026-07-28"`. Discovery succeeded at that revision, but
-`list_tools` failed SDK response validation because `cacheScope` and `ttlMs`
-were absent; `call_tool` also failed when it tried to list tools for result
-validation. Independent end-to-end interoperability therefore remains
-unverified. No live connector was exercised.
+server with `mode="2026-07-28"`. The initial check failed SDK validation because
+`cacheScope` and `ttlMs` were absent. After adding the required hints,
+`scripts/mcp_sdk_2026_probe.py` passed actual discovery, tool listing and
+`get_guidelines` call, and resource listing and reading. The probe explicitly
+sends discovery because the SDK's explicit-version mode otherwise synthesizes
+its discovery result. No live connector was exercised.
 
 Merge this into `~/.config/opencode/opencode.json`:
 

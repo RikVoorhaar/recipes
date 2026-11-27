@@ -47,7 +47,9 @@ authenticated MCP access. An unauthenticated request to `/mcp` should return
 without opening or modifying the database. Migrations run on startup.
 Publishing a GitHub release tagged `vMAJOR.MINOR.PATCH` runs checks and then
 builds and publishes that version tag to GHCR. PR and main CI do not build or
-publish an image; the release workflow does not publish `latest` or deploy.
+publish an image; the release workflow checks the event's tagged commit and
+builds that same commit, even if the Git tag later moves. It does not publish
+`latest` or deploy.
 Select a real published version with `RECIPES_IMAGE_TAG` before running Compose
 and retain the previous version for rollback. Changing the release or version
 does not automatically update a running deployment; deployment is manual.

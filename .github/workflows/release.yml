@@ -26,10 +26,12 @@ jobs:
           fi
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.sha }}
       - name: Record tested commit
         id: commit
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

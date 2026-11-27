@@ -2914,6 +2914,7 @@ dependencies = [
  "cooklang",
  "futures-util",
  "image",
+ "libsqlite3-sys",
  "lopdf",
  "pdf-extract",
  "reqwest",

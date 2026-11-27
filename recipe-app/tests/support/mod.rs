@@ -111,6 +111,14 @@ impl TestApp {
         reqwest::Client::new()
     }
 
+    pub fn database_path(&self) -> &std::path::Path {
+        &self.database_path
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub fn install_image_fixture(&self, reference: &str, bytes: &[u8]) {
         FileImageStorage::new(&self.content_dir)
             .put(reference, bytes)

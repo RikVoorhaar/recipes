@@ -15,6 +15,9 @@ starting it. The image runs as UID/GID **10001:10001**; the directory and any
 existing database, SQLite sidecar files and content must be writable by that
 identity. For a fresh directory, an operator can use `install -d -m 700 -o
 10001 -g 10001 recipes-data`. Do not blindly change ownership of existing data.
+File-backed databases use SQLite WAL mode and a five-second busy timeout.
+Writers still serialize and may fail if a lock lasts longer than that; the
+database directory must allow SQLite to create its `-wal` and `-shm` files.
 
 Create `.env` in that directory, restrict it to the deployment operator
 (`chmod 600 .env`), and keep it out of version control:

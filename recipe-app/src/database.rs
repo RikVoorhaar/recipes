@@ -1,5 +1,9 @@
-use sqlx::{migrate::Migrator, sqlite::SqliteConnectOptions, SqlitePool};
-use std::{error::Error, path::Path};
+use sqlx::{
+    migrate::Migrator,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode},
+    SqlitePool,
+};
+use std::{error::Error, path::Path, time::Duration};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
@@ -13,6 +17,8 @@ pub async fn connect(path: &Path) -> Result<SqlitePool, Box<dyn Error + Send + S
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5))
         .foreign_keys(true);
     Ok(SqlitePool::connect_with(options).await?)
 }

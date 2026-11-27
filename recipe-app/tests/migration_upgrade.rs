@@ -35,6 +35,64 @@ async fn apply_stage_two_schema(connection: &mut SqliteConnection) {
 }
 
 #[tokio::test]
+async fn migration_preserves_tokens_drafts_candidates_and_orphaned_drafts() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("legacy.sqlite3");
+    let mut connection = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true)
+        .connect()
+        .await
+        .unwrap();
+    apply_stage_two_schema(&mut connection).await;
+    for (version, description, sql) in [
+        (
+            3_i64,
+            "derived_ingredients",
+            include_str!("../migrations/0003_derived_ingredients.sql"),
+        ),
+        (
+            4,
+            "ingredient_resolution_provenance",
+            include_str!("../migrations/0004_ingredient_resolution_provenance.sql"),
+        ),
+        (5, "images", include_str!("../migrations/0005_images.sql")),
+        (6, "drafts", include_str!("../migrations/0006_drafts.sql")),
+        (
+            7,
+            "draft_cover_candidates",
+            include_str!("../migrations/0007_draft_cover_candidates.sql"),
+        ),
+    ] {
+        sqlx::raw_sql(sql).execute(&mut connection).await.unwrap();
+        sqlx::query("INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(?,?,1,?,0)")
+            .bind(version).bind(description).bind(Sha384::digest(sql.as_bytes()).to_vec())
+            .execute(&mut connection).await.unwrap();
+    }
+    sqlx::raw_sql(
+        "INSERT INTO api_tokens VALUES('old-hash','owner');
+        INSERT INTO recipe_drafts VALUES('d1','old-hash',1,NULL,NULL,'{}','yesterday','today');
+        INSERT INTO recipe_drafts VALUES('d2','orphan-hash',1,NULL,NULL,'{}','yesterday','today');
+        INSERT INTO draft_cover_candidates VALUES('image','d1','old-hash',1,'today');",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+    let pool = database::connect(&path).await.unwrap();
+    database::migrate(&pool).await.unwrap();
+    let row: (String, String, String, i64) = sqlx::query_as(
+        "SELECT t.token_hash,d.owner_token_id,c.owner_token_id,t.revoked FROM api_tokens t JOIN recipe_drafts d ON d.owner_token_id=t.id JOIN draft_cover_candidates c ON c.draft_id=d.id WHERE t.label='owner'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(row.0, "old-hash");
+    assert_eq!(row.1, row.2);
+    assert_eq!(row.3, 0);
+    let revoked: i64 = sqlx::query_scalar("SELECT t.revoked FROM api_tokens t JOIN recipe_drafts d ON d.owner_token_id=t.id WHERE d.id='d2'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(revoked, 1);
+}
+
+#[tokio::test]
 async fn populated_stage_two_database_migrates_and_backfills_ingredient_data() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("stage-two.sqlite3");

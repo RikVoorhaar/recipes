@@ -6,6 +6,7 @@ mod mcp_http;
 mod pdf;
 mod recipe_web;
 pub mod storage;
+pub mod token;
 
 use axum::{
     extract::{Path, Query, State},
@@ -61,25 +62,6 @@ impl RecipeService {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ApiToken {
-    pub label: String,
-    pub secret: String,
-}
-
-impl ApiToken {
-    pub fn from_config(value: &str) -> Result<Self, &'static str> {
-        let (label, secret) = value.split_once(':').ok_or("token must be label:secret")?;
-        if label.trim().is_empty() || secret.is_empty() {
-            return Err("token must have a non-empty label and secret");
-        }
-        Ok(Self {
-            label: label.trim().to_owned(),
-            secret: secret.to_owned(),
-        })
-    }
-}
-
 pub fn app(pool: SqlitePool) -> Router {
     app_with_storage(pool, Arc::new(FileImageStorage::new("data/content")))
 }
@@ -122,20 +104,19 @@ pub fn app_with_public_base_url(
 }
 
 pub async fn configure_tokens(pool: &SqlitePool, tokens: &[String]) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM api_tokens")
-        .execute(&mut *tx)
-        .await?;
     for configured in tokens {
-        let token = ApiToken::from_config(configured)
-            .map_err(|error| sqlx::Error::Protocol(error.to_owned()))?;
-        sqlx::query("INSERT INTO api_tokens(token_hash, label) VALUES (?, ?)")
-            .bind(token_hash(&token.secret))
-            .bind(token.label)
-            .execute(&mut *tx)
+        let (label, secret) = configured
+            .split_once(':')
+            .ok_or_else(|| sqlx::Error::Protocol("invalid token".into()))?;
+        sqlx::query("INSERT INTO api_tokens(token_hash,label,id,created_at) VALUES(?,?,?,?)")
+            .bind(token_hash(secret))
+            .bind(label)
+            .bind(Uuid::new_v4().to_string())
+            .bind(now())
+            .execute(pool)
             .await?;
     }
-    tx.commit().await
+    Ok(())
 }
 
 fn app_router(
@@ -246,33 +227,52 @@ fn token_hash(secret: &str) -> String {
 
 struct CallerIdentity {
     label: String,
-    token_hash: String,
+    token_id: String,
 }
 
 async fn authorize_secret(state: &RecipeService, value: &str) -> Result<CallerIdentity, ApiError> {
     let candidate = token_hash(value);
-    let rows = sqlx::query_as::<_, TokenRow>("SELECT token_hash, label FROM api_tokens")
-        .fetch_all(&state.pool)
-        .await
-        .map_err(internal_error)?;
-    let mut matched_label = None;
+    let rows = sqlx::query_as::<_, TokenRow>(
+        "SELECT token_hash, label, id FROM api_tokens WHERE revoked=0",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal_error)?;
+    let mut matched = None;
     for row in rows {
         if row.token_hash.as_bytes().ct_eq(candidate.as_bytes()).into() {
-            matched_label = Some(row.label);
+            matched = Some(row);
         }
     }
-    matched_label
-        .map(|label| CallerIdentity {
-            label,
-            token_hash: candidate,
-        })
-        .ok_or_else(|| ApiError::new("unauthorized", "The bearer token is invalid"))
+    let row =
+        matched.ok_or_else(|| ApiError::new("unauthorized", "The bearer token is invalid"))?;
+    // Last-use bookkeeping must not turn read-only requests into SQLite
+    // writers. It is best effort and checks the hash again after rotation.
+    let pool = state.pool.clone();
+    let id = row.id.clone();
+    let timestamp = now();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "UPDATE api_tokens SET last_used_at=? WHERE id=? AND token_hash=? AND revoked=0 AND (last_used_at IS NULL OR last_used_at < ?)",
+        )
+        .bind(&timestamp)
+        .bind(id)
+        .bind(candidate)
+        .bind(&timestamp)
+        .execute(&pool)
+        .await;
+    });
+    Ok(CallerIdentity {
+        label: row.label,
+        token_id: row.id,
+    })
 }
 
 #[derive(FromRow)]
 struct TokenRow {
     token_hash: String,
     label: String,
+    id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,7 +432,7 @@ async fn save_draft(
     caller: &CallerIdentity,
     mut write: DraftWrite,
 ) -> Result<DraftDocument, ApiError> {
-    let owner_id = &caller.token_hash;
+    let owner_id = &caller.token_id;
     if !write.document.is_object() {
         return Err(ApiError::new(
             "invalid_request",
@@ -444,7 +444,7 @@ async fn save_draft(
     let mut tx = state.pool.begin().await.map_err(internal_error)?;
     if let Some(expected) = write.expected_revision {
         let locked = sqlx::query(
-            "UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?",
+            "UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_id=? AND revision=?",
         )
         .bind(&id)
         .bind(owner_id)
@@ -467,7 +467,7 @@ async fn save_draft(
                 .execute(&mut *tx)
                 .await
         } else {
-            sqlx::query("UPDATE api_tokens SET label=label WHERE token_hash=?")
+            sqlx::query("UPDATE api_tokens SET label=label WHERE id=? AND revoked=0")
                 .bind(owner_id)
                 .execute(&mut *tx)
                 .await
@@ -478,7 +478,7 @@ async fn save_draft(
         }
     }
     let existing = sqlx::query_as::<_, DraftRow>(
-        "SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_hash=?",
+        "SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_id=?",
     )
     .bind(&id).bind(owner_id).fetch_optional(&mut *tx).await.map_err(internal_error)?;
     let (revision, base_recipe, base_revision, document) = if let Some(existing) = existing {
@@ -536,7 +536,7 @@ async fn save_draft(
         (1, base_recipe, base_revision, write.document)
     };
     let encoded = serde_json::to_string(&document).map_err(internal_error)?;
-    let saved = sqlx::query("INSERT INTO recipe_drafts(id,owner_token_hash,revision,base_recipe_id,base_revision_id,document,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision, document=excluded.document, updated_at=excluded.updated_at WHERE owner_token_hash=excluded.owner_token_hash AND revision=?")
+    let saved = sqlx::query("INSERT INTO recipe_drafts(id,owner_token_id,revision,base_recipe_id,base_revision_id,document,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision, document=excluded.document, updated_at=excluded.updated_at WHERE owner_token_id=excluded.owner_token_id AND revision=?")
         .bind(&id).bind(owner_id).bind(revision).bind(&base_recipe).bind(&base_revision).bind(encoded).bind(&timestamp).bind(&timestamp)
         .bind(revision - 1)
         .execute(&mut *tx).await.map_err(internal_error)?;
@@ -559,8 +559,8 @@ async fn get_draft(
     caller: &CallerIdentity,
     id: &str,
 ) -> Result<DraftDocument, ApiError> {
-    let row = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
-        .bind(id).bind(&caller.token_hash).fetch_optional(&state.pool).await.map_err(internal_error)?
+    let row = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_id=?")
+        .bind(id).bind(&caller.token_id).fetch_optional(&state.pool).await.map_err(internal_error)?
         .ok_or_else(|| ApiError::new("not_found", "Draft not found"))?;
     row.document()
 }
@@ -569,8 +569,8 @@ async fn list_drafts(
     state: &RecipeService,
     caller: &CallerIdentity,
 ) -> Result<Vec<DraftDocument>, ApiError> {
-    let rows = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE owner_token_hash=? ORDER BY updated_at,id")
-        .bind(&caller.token_hash).fetch_all(&state.pool).await.map_err(internal_error)?;
+    let rows = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE owner_token_id=? ORDER BY updated_at,id")
+        .bind(&caller.token_id).fetch_all(&state.pool).await.map_err(internal_error)?;
     rows.into_iter()
         .map(|row| row.document())
         .collect::<Result<Vec<_>, _>>()
@@ -589,9 +589,9 @@ async fn discard_draft(
         ));
     }
     let result =
-        sqlx::query("DELETE FROM recipe_drafts WHERE id=? AND owner_token_hash=? AND revision=?")
+        sqlx::query("DELETE FROM recipe_drafts WHERE id=? AND owner_token_id=? AND revision=?")
             .bind(id)
-            .bind(&caller.token_hash)
+            .bind(&caller.token_id)
             .bind(revision.expected_revision)
             .execute(&state.pool)
             .await
@@ -611,7 +611,7 @@ async fn publish_draft(
     id: &str,
     expected: DraftRevision,
 ) -> Result<SaveResult, ApiError> {
-    let owner_id = &caller.token_hash;
+    let owner_id = &caller.token_id;
     let author = &caller.label;
     if expected.expected_revision <= 0 {
         return Err(ApiError::new(
@@ -623,7 +623,7 @@ async fn publish_draft(
     // Acquire SQLite's write lock before reading so concurrent publishers serialize
     // instead of both opening deferred read transactions and failing lock upgrade.
     let locked = sqlx::query(
-        "UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?",
+        "UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_id=? AND revision=?",
     )
     .bind(id)
     .bind(owner_id)
@@ -637,7 +637,7 @@ async fn publish_draft(
             "Draft not found or revision changed",
         ));
     }
-    let row = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
+    let row = sqlx::query_as::<_, DraftRow>("SELECT id,revision,base_recipe_id,base_revision_id,document,updated_at FROM recipe_drafts WHERE id=? AND owner_token_id=?")
         .bind(id).bind(owner_id).fetch_optional(&mut *tx).await.map_err(internal_error)?
         .ok_or_else(|| ApiError::new("not_found", "Draft not found"))?;
     if row.revision != expected.expected_revision {
@@ -677,7 +677,7 @@ async fn publish_draft(
     let warnings = state.parse_body(&write.body)?;
     if let Some(reference) = expected.image_ref.as_deref() {
         let candidate: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM draft_cover_candidates WHERE image_ref=? AND draft_id=? AND owner_token_hash=? AND draft_revision=?",
+            "SELECT 1 FROM draft_cover_candidates WHERE image_ref=? AND draft_id=? AND owner_token_id=? AND draft_revision=?",
         )
         .bind(reference)
         .bind(id)
@@ -756,7 +756,7 @@ async fn publish_draft(
             .map_err(internal_error)?;
     }
     derive_revision(&mut tx, &revision_id, &write.body, author).await?;
-    sqlx::query("DELETE FROM recipe_drafts WHERE id=? AND owner_token_hash=? AND revision=?")
+    sqlx::query("DELETE FROM recipe_drafts WHERE id=? AND owner_token_id=? AND revision=?")
         .bind(id)
         .bind(owner_id)
         .bind(expected.expected_revision)
@@ -1691,7 +1691,7 @@ async fn generate_draft_cover(
     id: &str,
     request: GenerateDraftCover,
 ) -> Result<DraftCoverCandidate, ApiError> {
-    let owner = &caller.token_hash;
+    let owner = &caller.token_id;
     if request.expected_revision <= 0 {
         return Err(ApiError::new(
             "invalid_request",
@@ -1703,7 +1703,7 @@ async fn generate_draft_cover(
         .as_ref()
         .ok_or_else(|| ApiError::new("invalid_request", "Cover generation is not configured"))?;
     let exists: Option<i64> =
-        sqlx::query_scalar("SELECT revision FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
+        sqlx::query_scalar("SELECT revision FROM recipe_drafts WHERE id=? AND owner_token_id=?")
             .bind(id)
             .bind(owner)
             .fetch_optional(&state.pool)
@@ -1728,8 +1728,15 @@ async fn generate_draft_cover(
     // Commit the private guard before writing to shared storage. This durable guard
     // survives either a failed file write or a later candidate-row failure.
     let mut tx = state.pool.begin().await.map_err(internal_error)?;
-    let locked = sqlx::query("UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?")
-        .bind(id).bind(owner).bind(request.expected_revision).execute(&mut *tx).await.map_err(internal_error)?;
+    let locked = sqlx::query(
+        "UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_id=? AND revision=?",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(request.expected_revision)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_error)?;
     if locked.rows_affected() == 0 {
         return Err(ApiError::new(
             "conflict",
@@ -1748,15 +1755,22 @@ async fn generate_draft_cover(
         .map_err(internal_error)?;
     // Recheck after I/O; a changed/deleted draft leaves only a guarded orphan.
     let mut tx = state.pool.begin().await.map_err(internal_error)?;
-    let locked = sqlx::query("UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_hash=? AND revision=?")
-        .bind(id).bind(owner).bind(request.expected_revision).execute(&mut *tx).await.map_err(internal_error)?;
+    let locked = sqlx::query(
+        "UPDATE recipe_drafts SET revision=revision WHERE id=? AND owner_token_id=? AND revision=?",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(request.expected_revision)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_error)?;
     if locked.rows_affected() == 0 {
         return Err(ApiError::new(
             "conflict",
             "The draft changed during cover generation",
         ));
     }
-    sqlx::query("INSERT INTO draft_cover_candidates(image_ref,draft_id,owner_token_hash,draft_revision,created_at) VALUES(?,?,?,?,?)")
+    sqlx::query("INSERT INTO draft_cover_candidates(image_ref,draft_id,owner_token_id,draft_revision,created_at) VALUES(?,?,?,?,?)")
         .bind(&reference).bind(id).bind(owner).bind(request.expected_revision).bind(now())
         .execute(&mut *tx).await.map_err(internal_error)?;
     tx.commit().await.map_err(internal_error)?;
@@ -1771,9 +1785,9 @@ async fn get_draft_cover(
     id: &str,
     reference: &str,
 ) -> Result<Vec<u8>, ApiError> {
-    let owner = &caller.token_hash;
+    let owner = &caller.token_id;
     let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT owner_token_hash,draft_revision FROM draft_cover_candidates WHERE image_ref=? AND draft_id=?",
+        "SELECT owner_token_id,draft_revision FROM draft_cover_candidates WHERE image_ref=? AND draft_id=?",
     ).bind(reference).bind(id).fetch_optional(&state.pool).await.map_err(internal_error)?;
     let Some((candidate_owner, candidate_revision)) = row else {
         return Err(ApiError::new(
@@ -1782,7 +1796,7 @@ async fn get_draft_cover(
         ));
     };
     let current_revision: Option<i64> =
-        sqlx::query_scalar("SELECT revision FROM recipe_drafts WHERE id=? AND owner_token_hash=?")
+        sqlx::query_scalar("SELECT revision FROM recipe_drafts WHERE id=? AND owner_token_id=?")
             .bind(id)
             .bind(owner)
             .fetch_optional(&state.pool)

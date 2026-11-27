@@ -23,8 +23,6 @@ Create `.env` in that directory, restrict it to the deployment operator
 (`chmod 600 .env`), and keep it out of version control:
 
 ```dotenv
-# Temporary token configuration pending #15; replace with a strong secret.
-APP__API_TOKENS=owner:replace-with-a-secret
 # Select an existing published version; there is no latest tag.
 RECIPES_IMAGE_TAG=v1.2.3
 # Optional; enables cover generation.
@@ -33,9 +31,9 @@ APP__OPENROUTER_API_KEY=replace-with-provider-key
 APP__MCP_ALLOWED_ORIGINS=https://recipes.rikvoorhaar.com
 ```
 
-Remove optional entries if not needed. Tokens are comma-separated
-`label:secret` pairs; clients send only the secret. Treat labels as stable
-owner identities and protect the env file and Docker access. Empty origin
+Remove optional entries if not needed. Remove any old `APP__API_TOKENS`
+entry after upgrading: existing database tokens are retained, but configuration
+no longer provisions them. Protect the env file and Docker access. Empty origin
 configuration rejects requests carrying Origin, while non-browser requests
 without Origin remain usable. Do not put secrets in command arguments.
 The Compose file configures the public base URL explicitly; it is used for MCP
@@ -48,6 +46,26 @@ After reviewing the file and provisioning secrets and storage, use
 authenticated MCP access. An unauthenticated request to `/mcp` should return
 401. The `recipe-app healthcheck` command probes the configured local listener
 without opening or modifying the database. Migrations run on startup.
+
+Create the first token after startup from the host (never via MCP):
+
+```sh
+docker compose exec -T recipes /app/recipe-app token create --label perplexity
+docker compose exec -T recipes /app/recipe-app token list
+docker compose exec -T recipes /app/recipe-app token rotate --label perplexity
+docker compose exec -T recipes /app/recipe-app token revoke --label perplexity
+```
+
+Create and rotate print the new `rcp_` secret once; copy it securely to the
+client. It cannot be recovered from the database. Never put secrets in command
+arguments, environment variables, configuration files, logs or chat. List
+shows labels, creation and best-effort last-use timestamps, and status only.
+Last-use updates may lag or be missed during database contention. Changes are
+effective immediately without restart. Rotation invalidates the old secret and
+retains its private drafts and cover candidates. Revocation preserves those
+drafts but makes them inaccessible; creating another token does not transfer
+them. Existing tokens and drafts migrate automatically, including orphaned
+drafts, which remain inaccessible. Back up before upgrading.
 Publishing a GitHub release tagged `vMAJOR.MINOR.PATCH` runs checks and then
 builds and publishes that version tag to GHCR. PR and main CI do not build or
 publish an image; the release workflow checks the event's tagged commit and

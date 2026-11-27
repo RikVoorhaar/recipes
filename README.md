@@ -24,7 +24,12 @@ Merge this into `~/.config/opencode/opencode.json`:
 }
 ```
 
-Save your bearer **secret** (not `label:secret`) to `~/.config/recipes.token` on the OpenCode machine and set permissions with `chmod 600 ~/.config/recipes.token`. OpenCode reads it through [file substitution](https://opencode.ai/docs/config#variables). Keep it outside the repo; never put the secret in config, commands, prompts, or chat.
+An operator creates a bearer secret using the host-local CLI described in
+[operations](docs/operations.md). Save the printed `rcp_` secret to
+`~/.config/recipes.token` on the OpenCode machine and set permissions with
+`chmod 600 ~/.config/recipes.token`. OpenCode reads it through
+[file substitution](https://opencode.ai/docs/config#variables). Keep it
+outside the repo; never put the secret in config, commands, prompts, or chat.
 
 For browser-based MCP clients, configure trusted origins explicitly using
 `mcp_allowed_origins = ["https://inspector.example"]` in `config.toml`, or

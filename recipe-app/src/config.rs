@@ -8,8 +8,6 @@ pub struct Settings {
     pub database_path: PathBuf,
     pub content_dir: PathBuf,
     #[serde(default)]
-    pub api_tokens: Vec<String>,
-    #[serde(default)]
     pub mcp_allowed_origins: Vec<String>,
     #[serde(default)]
     pub public_base_url: Option<String>,
@@ -30,18 +28,6 @@ impl Settings {
         let config_file = match std::env::var("APP_CONFIG_FILE") {
             Ok(path) => path,
             Err(std::env::VarError::NotPresent) => "config.toml".into(),
-            Err(std::env::VarError::NotUnicode(_)) => return Err(invalid_configuration().into()),
-        };
-        let environment_tokens = match std::env::var("APP__API_TOKENS") {
-            Ok(value) => Some(
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|token| !token.is_empty())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>(),
-            ),
-            Err(std::env::VarError::NotPresent) => None,
             Err(std::env::VarError::NotUnicode(_)) => return Err(invalid_configuration().into()),
         };
         let environment_origins = match std::env::var("APP__MCP_ALLOWED_ORIGINS") {
@@ -67,13 +53,6 @@ impl Settings {
             .map_err(|_| invalid_configuration())?
             .add_source(File::from(PathBuf::from(config_file)).required(false))
             .add_source(Environment::with_prefix("APP").separator("__"));
-        let settings = if let Some(tokens) = environment_tokens {
-            settings
-                .set_override("api_tokens", tokens)
-                .map_err(|_| invalid_configuration())?
-        } else {
-            settings
-        };
         let settings = if let Some(origins) = environment_origins {
             settings
                 .set_override("mcp_allowed_origins", origins)

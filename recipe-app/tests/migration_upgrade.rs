@@ -70,10 +70,12 @@ async fn migration_preserves_tokens_drafts_candidates_and_orphaned_drafts() {
             .execute(&mut connection).await.unwrap();
     }
     sqlx::raw_sql(
-        "INSERT INTO api_tokens VALUES('old-hash','owner');
-        INSERT INTO recipe_drafts VALUES('d1','old-hash',1,NULL,NULL,'{}','yesterday','today');
+        "INSERT INTO api_tokens VALUES('02811e4a991a586c7538db3f3e087c2d25b3a503cdb755f29e550114af13731b','owner');
+        INSERT INTO api_tokens VALUES('c2f225c53e902e19125a5881958950fb9469c5b15006d20049c4f2bde2b112e3','owner');
+        INSERT INTO recipe_drafts VALUES('d1','02811e4a991a586c7538db3f3e087c2d25b3a503cdb755f29e550114af13731b',1,NULL,NULL,'{}','yesterday','today');
+        INSERT INTO recipe_drafts VALUES('d3','c2f225c53e902e19125a5881958950fb9469c5b15006d20049c4f2bde2b112e3',1,NULL,NULL,'{}','yesterday','today');
         INSERT INTO recipe_drafts VALUES('d2','orphan-hash',1,NULL,NULL,'{}','yesterday','today');
-        INSERT INTO draft_cover_candidates VALUES('image','d1','old-hash',1,'today');",
+        INSERT INTO draft_cover_candidates VALUES('image','d1','02811e4a991a586c7538db3f3e087c2d25b3a503cdb755f29e550114af13731b',1,'today');",
     )
     .execute(&mut connection)
     .await
@@ -84,12 +86,64 @@ async fn migration_preserves_tokens_drafts_candidates_and_orphaned_drafts() {
     let row: (String, String, String, i64) = sqlx::query_as(
         "SELECT t.token_hash,d.owner_token_id,c.owner_token_id,t.revoked FROM api_tokens t JOIN recipe_drafts d ON d.owner_token_id=t.id JOIN draft_cover_candidates c ON c.draft_id=d.id WHERE t.label='owner'")
         .fetch_one(&pool).await.unwrap();
-    assert_eq!(row.0, "old-hash");
+    assert_eq!(
+        row.0,
+        "02811e4a991a586c7538db3f3e087c2d25b3a503cdb755f29e550114af13731b"
+    );
     assert_eq!(row.1, row.2);
     assert_eq!(row.3, 0);
     let revoked: i64 = sqlx::query_scalar("SELECT t.revoked FROM api_tokens t JOIN recipe_drafts d ON d.owner_token_id=t.id WHERE d.id='d2'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(revoked, 1);
+    let second_id: String =
+        sqlx::query_scalar("SELECT owner_token_id FROM recipe_drafts WHERE id='d3'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(row.1, second_id);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let app = recipe_app::app(pool.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let ping = |secret: &str| {
+        client
+            .post(&url)
+            .bearer_auth(secret)
+            .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+    };
+    assert_eq!(ping("legacy-first").send().await.unwrap().status(), 200);
+    assert_eq!(ping("legacy-second").send().await.unwrap().status(), 200);
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_recipe-app"))
+            .env("APP__DATABASE_PATH", &path)
+            .env("APP__CONTENT_DIR", directory.path().join("content"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let listing = run(&["token", "list"]);
+    let listing = String::from_utf8(listing.stdout).unwrap();
+    assert!(listing.contains(&row.1) && listing.contains(&second_id));
+    assert!(!run(&["token", "rotate", "--label", "owner"])
+        .status
+        .success());
+    let rotated = run(&["token", "rotate", "--id", &row.1]);
+    assert!(rotated.status.success());
+    let replacement = String::from_utf8(rotated.stdout).unwrap();
+    assert!(replacement.starts_with("rcp_"));
+    assert!(run(&["token", "revoke", "--id", &second_id])
+        .status
+        .success());
+    assert_eq!(ping("legacy-first").send().await.unwrap().status(), 401);
+    assert_eq!(ping("legacy-second").send().await.unwrap().status(), 401);
+    assert_eq!(ping(replacement.trim()).send().await.unwrap().status(), 200);
+    let owners: Vec<(String, String, i64)> = sqlx::query_as("SELECT d.id,t.id,t.revoked FROM recipe_drafts d JOIN api_tokens t ON t.id=d.owner_token_id WHERE d.id IN ('d1','d3') ORDER BY d.id")
+        .fetch_all(&pool).await.unwrap();
+    assert_eq!(
+        owners,
+        vec![("d1".into(), row.1, 0), ("d3".into(), second_id, 1)]
+    );
 }
 
 #[tokio::test]

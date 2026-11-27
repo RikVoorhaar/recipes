@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 #[derive(FromRow)]
 pub struct TokenInfo {
+    pub id: String,
     pub label: String,
     pub created_at: String,
     pub last_used_at: Option<String>,
@@ -22,9 +23,35 @@ fn valid_label(label: &str) -> bool {
 }
 
 pub async fn list(pool: &SqlitePool) -> Result<Vec<TokenInfo>, sqlx::Error> {
-    sqlx::query_as("SELECT label,created_at,last_used_at,revoked FROM api_tokens ORDER BY label,id")
-        .fetch_all(pool)
-        .await
+    sqlx::query_as(
+        "SELECT id,label,created_at,last_used_at,revoked FROM api_tokens ORDER BY label,id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn rotate_id(pool: &SqlitePool, id: &str) -> Result<String, sqlx::Error> {
+    let value = secret();
+    let result = sqlx::query("UPDATE api_tokens SET token_hash=? WHERE id=? AND revoked=0")
+        .bind(super::token_hash(&value))
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol("active token ID not found".into()));
+    }
+    Ok(value)
+}
+
+pub async fn revoke_id(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    let result = sqlx::query("UPDATE api_tokens SET revoked=1 WHERE id=? AND revoked=0")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol("active token ID not found".into()));
+    }
+    Ok(())
 }
 
 pub async fn create(pool: &SqlitePool, label: &str) -> Result<String, sqlx::Error> {

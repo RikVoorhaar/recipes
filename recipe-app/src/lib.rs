@@ -24,7 +24,8 @@ use sqlx::{FromRow, SqlitePool};
 use std::{
     collections::{HashMap, HashSet},
     io,
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use storage::{FileImageStorage, ImageStorage};
 use subtle::ConstantTimeEq;
@@ -39,6 +40,12 @@ pub(crate) struct RecipeService {
     cover_generator: Option<Arc<Generator>>,
     mcp_allowed_origins: Arc<Vec<String>>,
     public_base_url: Option<reqwest::Url>,
+    token_activity: Arc<TokenActivity>,
+}
+
+struct TokenActivity {
+    last_attempt: Mutex<HashMap<String, Instant>>,
+    writer: Arc<tokio::sync::Semaphore>,
 }
 
 impl RecipeService {
@@ -54,6 +61,10 @@ impl RecipeService {
             cover_generator,
             mcp_allowed_origins: Arc::new(Vec::new()),
             public_base_url: None,
+            token_activity: Arc::new(TokenActivity {
+                last_attempt: Mutex::new(HashMap::new()),
+                writer: Arc::new(tokio::sync::Semaphore::new(1)),
+            }),
         }
     }
 
@@ -228,6 +239,7 @@ fn token_hash(secret: &str) -> String {
 struct CallerIdentity {
     label: String,
     token_id: String,
+    token_hash: String,
 }
 
 async fn authorize_secret(state: &RecipeService, value: &str) -> Result<CallerIdentity, ApiError> {
@@ -248,24 +260,51 @@ async fn authorize_secret(state: &RecipeService, value: &str) -> Result<CallerId
         matched.ok_or_else(|| ApiError::new("unauthorized", "The bearer token is invalid"))?;
     // Last-use bookkeeping must not turn read-only requests into SQLite
     // writers. It is best effort and checks the hash again after rotation.
-    let pool = state.pool.clone();
-    let id = row.id.clone();
-    let timestamp = now();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
-            "UPDATE api_tokens SET last_used_at=? WHERE id=? AND token_hash=? AND revoked=0 AND (last_used_at IS NULL OR last_used_at < ?)",
-        )
-        .bind(&timestamp)
-        .bind(id)
-        .bind(candidate)
-        .bind(&timestamp)
-        .execute(&pool)
-        .await;
-    });
+    record_token_activity(state, &row.id, &candidate);
     Ok(CallerIdentity {
         label: row.label,
         token_id: row.id,
+        token_hash: candidate,
     })
+}
+
+fn record_token_activity(state: &RecipeService, id: &str, hash: &str) {
+    let Ok(permit) = state.token_activity.writer.clone().try_acquire_owned() else {
+        return;
+    };
+    let mut attempts = state.token_activity.last_attempt.lock().unwrap();
+    let instant = Instant::now();
+    attempts.retain(|_, previous| instant.duration_since(*previous) < Duration::from_secs(60));
+    if attempts.contains_key(id) || attempts.len() >= 1024 {
+        return;
+    }
+    attempts.insert(id.to_owned(), instant);
+    drop(attempts);
+    let pool = state.pool.clone();
+    let id = id.to_owned();
+    let hash = hash.to_owned();
+    let timestamp = now();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _ = sqlx::query(
+            "UPDATE api_tokens SET last_used_at=? WHERE id=? AND token_hash=? AND revoked=0 AND (last_used_at IS NULL OR last_used_at < ?)",
+        )
+        .bind(&timestamp).bind(id).bind(hash).bind(&timestamp).execute(&pool).await;
+    });
+}
+
+async fn caller_is_active(
+    state: &RecipeService,
+    caller: &CallerIdentity,
+) -> Result<bool, ApiError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM api_tokens WHERE id=? AND token_hash=? AND revoked=0)",
+    )
+    .bind(&caller.token_id)
+    .bind(&caller.token_hash)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(internal_error)
 }
 
 #[derive(FromRow)]

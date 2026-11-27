@@ -56,16 +56,29 @@ docker compose exec -T recipes /app/recipe-app token rotate --label perplexity
 docker compose exec -T recipes /app/recipe-app token revoke --label perplexity
 ```
 
+`list` includes stable token IDs. If migrated credentials share a label,
+`--label` refuses to select ambiguously; use `token rotate --id ID` or
+`token revoke --id ID` to manage each credential without transferring drafts.
+
 Create and rotate print the new `rcp_` secret once; copy it securely to the
 client. It cannot be recovered from the database. Never put secrets in command
 arguments, environment variables, configuration files, logs or chat. List
 shows labels, creation and best-effort last-use timestamps, and status only.
-Last-use updates may lag or be missed during database contention. Changes are
+Last-use updates are best effort, attempted at most once per token per minute
+per server process, with at most one activity write in flight. They may lag or
+be missed during contention. Changes are
 effective immediately without restart. Rotation invalidates the old secret and
 retains its private drafts and cover candidates. Revocation preserves those
 drafts but makes them inaccessible; creating another token does not transfer
 them. Existing tokens and drafts migrate automatically, including orphaned
 drafts, which remain inaccessible. Back up before upgrading.
+
+Each new request is authenticated against the database, and each message in an
+MCP batch is rechecked immediately before dispatch. Revocation or rotation
+does not cancel a tool already dispatched: it may finish, including writes,
+after the credential changes. If a batch loses authorization between messages,
+the server returns 401 and does not dispatch the remaining messages; earlier
+messages may already have taken effect.
 Publishing a GitHub release tagged `vMAJOR.MINOR.PATCH` runs checks and then
 builds and publishes that version tag to GHCR. PR and main CI do not build or
 publish an image; the release workflow checks the event's tagged commit and

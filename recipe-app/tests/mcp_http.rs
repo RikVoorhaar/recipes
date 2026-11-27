@@ -96,6 +96,50 @@ fn tool_json(result: &Value) -> Value {
 }
 
 #[tokio::test]
+async fn activity_under_write_lock_does_not_starve_requests_or_token_management() {
+    let (dir, url) = server().await;
+    let pool = database::connect(&dir.path().join("db.sqlite"))
+        .await
+        .unwrap();
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query("UPDATE api_tokens SET label=label WHERE label='owner'")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let requests = (0..100).map(|_| {
+        client
+            .post(&url)
+            .bearer_auth("first")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+            .send()
+    });
+    let responses = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        futures_util::future::join_all(requests),
+    )
+    .await
+    .expect("reads must not wait for activity writes");
+    assert!(responses.into_iter().all(|r| r.unwrap().status() == 200));
+    writer.commit().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        recipe_app::token::revoke(&pool, "owner"),
+    )
+    .await
+    .expect("revoke should not be starved")
+    .unwrap();
+    let response = client
+        .post(&url)
+        .bearer_auth("first")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
+
+#[tokio::test]
 async fn host_cli_changes_are_visible_to_running_mcp_and_rotation_keeps_drafts() {
     let (dir, url) = server().await;
     let run = |args: &[&str]| {

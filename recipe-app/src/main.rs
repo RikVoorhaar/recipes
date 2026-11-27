@@ -45,10 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.first().map(String::as_str) == Some("token") {
         match args.as_slice() {
             [_, command] if command == "list" => {
-                println!("LABEL\tCREATED\tLAST USED\tSTATUS");
+                println!("ID\tLABEL\tCREATED\tLAST USED\tSTATUS");
                 for token in recipe_app::token::list(&pool).await? {
                     println!(
-                        "{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}",
+                        token.id,
                         token.label,
                         token.created_at,
                         token.last_used_at.as_deref().unwrap_or("-"),
@@ -62,7 +63,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 "revoke" => recipe_app::token::revoke(&pool, label).await?,
                 _ => return Err("invalid token command".into()),
             },
-            _ => return Err("usage: token list | token create|rotate|revoke --label LABEL".into()),
+            [_, command, flag, id] if flag == "--id" => match command.as_str() {
+                "rotate" => println!("{}", recipe_app::token::rotate_id(&pool, id).await?),
+                "revoke" => recipe_app::token::revoke_id(&pool, id).await?,
+                _ => return Err("invalid token command".into()),
+            },
+            _ => return Err("usage: token list | token create --label LABEL | token rotate|revoke --label LABEL | --id ID".into()),
         }
         return Ok(());
     }

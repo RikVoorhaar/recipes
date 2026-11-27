@@ -4,7 +4,43 @@ mod mcp;
 mod support;
 
 use serde_json::json;
-use std::{path::Path, process::Command, time::Duration};
+use std::{
+    ffi::{c_int, c_void},
+    path::Path,
+    process::Command,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
+
+static BUSY_OBSERVED: AtomicBool = AtomicBool::new(false);
+
+// Test-only replacement for SQLite's timeout handler. It signals that the app
+// actually encountered the other process's lock, then retries for up to 5s.
+unsafe extern "C" fn observe_busy(_: *mut c_void, attempts: c_int) -> c_int {
+    BUSY_OBSERVED.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(10));
+    i32::from(attempts < 500)
+}
+
+async fn observe_pool_contention(pool: &sqlx::SqlitePool) {
+    let mut connections = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        connections.push(pool.acquire().await.unwrap());
+    }
+    for connection in &mut connections {
+        let mut handle = connection.lock_handle().await.unwrap();
+        // SAFETY: the locked handle is a valid SQLite connection; the callback
+        // uses no context pointer and its static state outlives every connection.
+        let result = unsafe {
+            libsqlite3_sys::sqlite3_busy_handler(
+                handle.as_raw_handle().as_ptr(),
+                Some(observe_busy),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, libsqlite3_sys::SQLITE_OK);
+    }
+}
 
 async fn wait_for_file(path: &Path) {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -60,6 +96,7 @@ async fn ingredient_alias_waits_for_another_process_writer() {
     let ingredients = mcp::tool(&client, &base, "test-secret", "list_ingredients", json!({})).await;
     let id = ingredients[0]["id"].as_str().unwrap().to_owned();
 
+    observe_pool_contention(app.pool()).await;
     let dir = tempfile::tempdir().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "hold_other_process_writer", "--ignored"])
@@ -92,22 +129,26 @@ async fn ingredient_alias_waits_for_another_process_writer() {
         )
         .await
     });
-    let early = tokio::time::timeout(Duration::from_millis(500), &mut request).await;
+    let contention = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if BUSY_OBSERVED.load(Ordering::SeqCst) {
+                break Ok(());
+            }
+            if request.is_finished() {
+                break Err("mutation completed without encountering the writer lock");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     std::fs::write(dir.path().join("release"), "").unwrap();
     assert!(child.wait().unwrap().success());
-    match early {
-        Ok(result) => panic!(
-            "ingredient mutation finished while writer held lock: {:?}",
-            result.unwrap()
-        ),
-        Err(_) => {
-            let result = tokio::time::timeout(Duration::from_secs(6), request)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_ne!(result["isError"], true, "{result}");
-        }
-    }
+    assert_eq!(contention.expect("mutation never reached the lock"), Ok(()));
+    let result = tokio::time::timeout(Duration::from_secs(6), &mut request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(result["isError"], true, "{result}");
     let detail = mcp::tool(
         &app.client(),
         &app.url(""),

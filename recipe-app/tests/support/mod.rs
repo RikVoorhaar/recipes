@@ -115,6 +115,10 @@ impl TestApp {
         &self.database_path
     }
 
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub fn install_image_fixture(&self, reference: &str, bytes: &[u8]) {
         FileImageStorage::new(&self.content_dir)
             .put(reference, bytes)

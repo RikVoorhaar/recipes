@@ -43,8 +43,13 @@ After reviewing the file and provisioning secrets and storage, use
 authenticated MCP access. An unauthenticated request to `/mcp` should return
 401. The `recipe-app healthcheck` command probes the configured local listener
 without opening or modifying the database. Migrations run on startup.
-The image is published as `latest` and commit-SHA tags after CI passes; pin a
-SHA for reproducible upgrades and retain the previous image for rollback.
+Main builds publish a commit-SHA tag after CI passes. Promotion to `latest` is
+serialized and checks that the commit is still the main tip immediately before
+promotion; obsolete builds and reruns keep their SHA tag but skip `latest`.
+If main advances between the check and promotion, `latest` can briefly lag
+until the newer main build passes and promotes; if that build fails, it remains
+at the last successful promotion. Pin a SHA for reproducible upgrades and
+retain the previous image for rollback.
 Before schema-affecting upgrades, make and verify a consistent backup.
 
 For a derived-data rebuild, stop the service and use the same Compose config
@@ -60,21 +65,34 @@ backup. `scripts/ops.py` remains available on the operator's checkout; it uses
 SQLite's online backup API and includes the content directory. Stop **all**
 writers before backup or dev-copy to keep the database and image files
 consistent with one another. Protect backups off-host; they contain private data.
-For example, after stopping the Compose service and checking it stopped:
+For example, after stopping the Compose service and checking it stopped, run
+the existing host script as root (or another identity explicitly authorized to
+traverse and read the UID 10001 data). Root can read the recommended mode-700
+directory without changing its permissions. Use absolute paths and a trusted
+checkout; ensure every parent directory is traversable by the chosen identity.
+Create protected, writable backup and restore parent directories in advance.
+The final backup and restore paths must not already exist:
 
 ```sh
-python3 scripts/ops.py backup --database /path/to/recipes-data/recipes.sqlite3 \
+sudo install -d -m 700 -o root -g root /secure/backup /secure/restore
+sudo python3 /path/to/trusted/checkout/scripts/ops.py backup \
+  --database /path/to/recipes-data/recipes.sqlite3 \
   --content /path/to/recipes-data/content --output /secure/backup/new-directory
-python3 scripts/ops.py restore --backup /secure/backup/new-directory \
+sudo python3 /path/to/trusted/checkout/scripts/ops.py restore \
+  --backup /secure/backup/new-directory \
   --destination /secure/restore/new-directory
 ```
 
 Restore verifies checksums and SQLite integrity and refuses an existing
-destination. Verify restored data and permissions before using it with a stopped
-service; never merge into live data. Restart with `docker compose up -d` and
-check health. `ops.py dev-copy` similarly requires a nonexistent destination
-and clears copied API tokens. Readable export/import (#8) and private Git
-backup/scheduling (#17) are separate work.
+destination. A root-run restore produces root-owned files; before using the
+restored directory as `/data`, ensure its database, content and directories are
+owned by UID/GID 10001 and writable by that identity, while keeping the data
+private. Adjust ownership only on the verified restored copy, not on the
+backup or a running service. Verify restored data and permissions before using
+it with a stopped service; never merge into live data. Restart with
+`docker compose up -d` and check health. `ops.py dev-copy` similarly requires
+a nonexistent destination and clears copied API tokens. Readable export/import
+(#8) and private Git backup/scheduling (#17) are separate work.
 
 ## Verification
 

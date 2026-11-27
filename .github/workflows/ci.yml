@@ -43,6 +43,36 @@ jobs:
         with:
           context: .
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: |
-            ghcr.io/rikvoorhaar/recipes:${{ github.sha }}
-            ghcr.io/rikvoorhaar/recipes:latest
+          tags: ghcr.io/rikvoorhaar/recipes:${{ github.sha }}
+
+  promote-latest:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: image
+    runs-on: ubuntu-latest
+    concurrency:
+      group: recipes-promote-latest
+      queue: max
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote only the current main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -eu
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          if [ "$main_sha" != "$COMMIT" ]; then
+            echo "Main has moved; retaining the SHA tag without updating latest."
+            exit 0
+          fi
+          docker buildx imagetools create \
+            --tag ghcr.io/rikvoorhaar/recipes:latest \
+            "ghcr.io/rikvoorhaar/recipes:${COMMIT}"

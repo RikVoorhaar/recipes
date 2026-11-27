@@ -5,3 +5,5 @@ api_tokens = []
 # Example trusted browser origin for /mcp; replace it with your own origins.
 # An empty list denies requests with Origin; requests without Origin are allowed.
 mcp_allowed_origins = ["https://recipes.rikvoorhaar.com"]
+# Optional externally reachable HTTP(S) base URL for published recipe links.
+# public_base_url = "https://recipes.example.com"

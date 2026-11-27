@@ -1,5 +1,6 @@
 use recipe_app::{
-    app_with_mcp_origins, config::Settings, cover::Generator, database, storage::FileImageStorage,
+    app_with_public_base_url, config::Settings, cover::Generator, database,
+    storage::FileImageStorage,
 };
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -50,11 +51,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     axum::serve(
         listener,
-        app_with_mcp_origins(
+        app_with_public_base_url(
             pool,
             Arc::new(FileImageStorage::new(settings.content_dir)),
             cover_generator,
             settings.mcp_allowed_origins,
+            settings
+                .public_base_url
+                .as_deref()
+                .and_then(recipe_app::config::parse_public_base_url),
         ),
     )
     .await?;

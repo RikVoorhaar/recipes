@@ -36,6 +36,12 @@ are rejected until configured. Never derive this allowlist from Host.
 The example configuration explicitly trusts the recipe site's origin; replace
 that value when deploying elsewhere.
 
+Set `public_base_url` in `config.toml` or `APP__PUBLIC_BASE_URL` to the
+externally reachable HTTP(S) base URL to include public recipe and PDF links in
+MCP results. A deployment path prefix is supported. Without it, links are
+omitted; request Host headers are never used. URLs with credentials, query
+strings, or fragments are rejected at startup.
+
 Config reloads automatically; if needed run `/reload`. In that session, use `/mcps` and confirm `recipes` connects, then call `recipes_get_guidelines` through MCP. If MCP or the call is unavailable, stop and ask—do not create a file or bypass MCP.
 
 Through MCP, first read `get_guidelines`, save the recipe as a draft, read it

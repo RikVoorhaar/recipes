@@ -10,6 +10,87 @@ const CONFIGURED_TOKEN: &str = "configured-token-secret-sentinel";
 const SECOND_CONFIGURED_TOKEN: &str = "second-configured-token-secret-sentinel";
 const AUTHORIZATION_SENTINEL: &str = "authorization-header-secret-sentinel";
 
+#[test]
+fn invalid_public_base_url_fails_before_startup() {
+    let directory = TempDir::new().unwrap();
+    for value in [
+        "not-a-url",
+        "https://example.com/?query=1",
+        "https://user:secret@example.com",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_recipe-app"))
+            .env_clear()
+            .env("APP_CONFIG_FILE", directory.path().join("missing.toml"))
+            .env("APP__CONTENT_DIR", directory.path().join("content"))
+            .env("APP__PUBLIC_BASE_URL", value)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{value}");
+        assert!(!directory.path().join("content").exists());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(value));
+    }
+}
+
+#[tokio::test]
+async fn configured_public_base_url_is_used_by_binary() {
+    let directory = TempDir::new().unwrap();
+    let address = available_address();
+    let child = Command::new(env!("CARGO_BIN_EXE_recipe-app"))
+        .env_clear()
+        .env("APP_CONFIG_FILE", directory.path().join("missing.toml"))
+        .env("APP__BIND_ADDR", address.to_string())
+        .env("APP__DATABASE_PATH", directory.path().join("db.sqlite"))
+        .env("APP__CONTENT_DIR", directory.path().join("content"))
+        .env("APP__API_TOKENS", "owner:secret")
+        .env("APP__PUBLIC_BASE_URL", "https://recipes.example/prefix")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    request_health(address).await;
+    let client = reqwest::Client::new();
+    let draft = mcp_tool(
+        &client,
+        address,
+        "save_draft",
+        serde_json::json!({"document":{"title":"Soup","servings":2,"body":"Cook @carrot{1}."}}),
+    )
+    .await;
+    let published = mcp_tool(
+        &client,
+        address,
+        "publish_draft",
+        serde_json::json!({"id":draft["id"],"expected_revision":1}),
+    )
+    .await;
+    let id = published["recipe"]["id"].as_str().unwrap();
+    assert_eq!(
+        published["recipe"]["public_url"],
+        format!("https://recipes.example/prefix/recipes/{id}")
+    );
+    assert_eq!(
+        published["recipe"]["pdf_url"],
+        format!("https://recipes.example/prefix/recipes/{id}.pdf")
+    );
+    stop_and_capture(child);
+}
+
+async fn mcp_tool(
+    client: &reqwest::Client,
+    address: SocketAddr,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let response: serde_json::Value = client.post(format!("http://{address}/mcp"))
+        .bearer_auth("secret")
+        .header("host", "untrusted.example")
+        .header("accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}}))
+        .send().await.unwrap().json().await.unwrap();
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
 #[tokio::test]
 async fn absent_origin_configuration_denies_origins_but_not_non_browser_requests() {
     let directory = TempDir::new().unwrap();

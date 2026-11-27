@@ -115,6 +115,10 @@ impl TestApp {
         &self.database_path
     }
 
+    pub fn content_dir(&self) -> &std::path::Path {
+        &self.content_dir
+    }
+
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }

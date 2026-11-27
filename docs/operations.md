@@ -68,6 +68,45 @@ and mounted data: `docker compose stop recipes`, then
 ## Backup, restore, and development copies
 
 There is no scheduled backup or borg integration in this deployment.
+
+### Readable book export and import
+
+With an appropriately mounted export directory, run `recipe-app export --dest
+/export/book`. The destination parent must exist. The command manages only
+paths in its manifest and refuses to overwrite unrelated files. It preserves
+`.git` and other unowned files. The versioned tree contains current published
+and soft-deleted recipes, their current public images, and the ingredient
+registry. It does not contain old revisions, credentials, drafts, private
+images, or ingredient history. Keep the existing `scripts/ops.py` procedure
+below as a fallback until a fresh-instance restore has been verified and the
+VPS cutover completed.
+
+For import, stop the application and use `recipe-app import --src /export/book`
+with the new instance's database and content settings. The database path must
+not exist; the content directory must be absent or empty, and both parent
+directories must exist. The import checks hashes, validates references and
+rebuilds into temporary storage before publishing either target. Configure
+credentials separately after import.
+
+An existing SQLite database is refused even if it appears empty. SQLite can
+have an active WAL reader while permitting a separate process to inspect its
+tables, so an emptiness check cannot prove that replacing its file is safe;
+tokens and other non-book state also make a database non-empty. Stop the app
+and select a **new, nonexistent** database filename and an absent or empty
+content directory, for example set `APP__DATABASE_PATH=/data/restore.sqlite3`
+and `APP__CONTENT_DIR=/data/restore-content` for the import and subsequent
+startup. Verify these paths and their parents first; do not remove or overwrite
+an existing database to make the command pass.
+
+The two target paths cannot be published atomically together. The content
+directory is populated first and the database is installed last. A process or
+machine crash during publication can leave content files without a database:
+inspect and clear only that incomplete fresh target before retrying. Likewise,
+export stages all files but its individual file replacements and manifest
+update are not an atomic group; after an interrupted export, restore the prior
+tree from Git before retrying. Run these commands without concurrent filesystem
+modification of their target paths; the path checks do not defend against a
+hostile process racing them.
 Copying a live SQLite database, especially in WAL mode, is not a consistent
 backup. `scripts/ops.py` remains available on the operator's checkout; it uses
 SQLite's online backup API and includes the content directory. Stop **all**

@@ -10,6 +10,39 @@ const CONFIGURED_TOKEN: &str = "configured-token-secret-sentinel";
 const SECOND_CONFIGURED_TOKEN: &str = "second-configured-token-secret-sentinel";
 const AUTHORIZATION_SENTINEL: &str = "authorization-header-secret-sentinel";
 
+#[tokio::test]
+async fn healthcheck_probes_server_without_creating_data() {
+    let directory = TempDir::new().unwrap();
+    let address = available_address();
+    let database = directory.path().join("db.sqlite");
+    let content = directory.path().join("content");
+    let probe = || {
+        Command::new(env!("CARGO_BIN_EXE_recipe-app"))
+            .arg("healthcheck")
+            .env_clear()
+            .env("APP_CONFIG_FILE", directory.path().join("missing.toml"))
+            .env("APP__BIND_ADDR", format!("0.0.0.0:{}", address.port()))
+            .env("APP__DATABASE_PATH", &database)
+            .env("APP__CONTENT_DIR", &content)
+            .output()
+            .unwrap()
+    };
+    assert!(!probe().status.success());
+    assert!(!database.exists());
+    assert!(!content.exists());
+    let child = start_binary(
+        &directory.path().join("missing.toml"),
+        &database,
+        &content,
+        address,
+        "owner:secret",
+    );
+    request_health(address).await;
+    assert!(probe().status.success());
+    stop_and_capture(child);
+    assert!(!probe().status.success());
+}
+
 #[test]
 fn invalid_public_base_url_fails_before_startup() {
     let directory = TempDir::new().unwrap();

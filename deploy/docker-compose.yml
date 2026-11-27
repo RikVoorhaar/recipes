@@ -1,0 +1,37 @@
+services:
+  recipes:
+    image: ghcr.io/rikvoorhaar/recipes:latest
+    container_name: recipes
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP__BIND_ADDR: 0.0.0.0:3000
+      APP__DATABASE_PATH: /data/recipes.sqlite3
+      APP__CONTENT_DIR: /data/content
+      APP__PUBLIC_BASE_URL: https://recipes.rikvoorhaar.com
+    volumes:
+      - ./recipes-data:/data
+    healthcheck:
+      test: ["CMD", "/app/recipe-app", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=recipes_internal"
+      - "traefik.http.services.recipes.loadbalancer.server.port=3000"
+      - "traefik.http.routers.recipes.rule=Host(`recipes.rikvoorhaar.com`)"
+      - "traefik.http.routers.recipes.entrypoints=websecure"
+      - "traefik.http.routers.recipes.tls=true"
+      - "traefik.http.routers.recipes-mcp.rule=Host(`recipes.rikvoorhaar.com`) && Path(`/mcp`)"
+      - "traefik.http.routers.recipes-mcp.entrypoints=websecure"
+      - "traefik.http.routers.recipes-mcp.tls=true"
+      - "traefik.http.routers.recipes-mcp.middlewares=recipes-mcp-limit,recipes-mcp-body"
+      - "traefik.http.middlewares.recipes-mcp-limit.ratelimit.average=20"
+      - "traefik.http.middlewares.recipes-mcp-limit.ratelimit.burst=40"
+      - "traefik.http.middlewares.recipes-mcp-body.buffering.maxRequestBodyBytes=10485760"
+    networks: [internal]
+networks:
+  internal:
+    name: recipes_internal

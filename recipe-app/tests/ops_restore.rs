@@ -10,6 +10,9 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[path = "support/mcp.rs"]
+mod mcp;
+
 const TOKEN: &str = "ops-restore-test-secret";
 
 struct RunningApp {
@@ -88,44 +91,36 @@ fn unused_address() -> SocketAddr {
     listener.local_addr().unwrap()
 }
 
-fn png(color: [u8; 3]) -> Vec<u8> {
+fn jpeg(color: [u8; 3]) -> Vec<u8> {
     let mut bytes = Cursor::new(Vec::new());
     DynamicImage::ImageRgb8(image::RgbImage::from_pixel(9, 7, Rgb(color)))
-        .write_to(&mut bytes, ImageFormat::Png)
+        .write_to(&mut bytes, ImageFormat::Jpeg)
         .unwrap();
     bytes.into_inner()
 }
 
-async fn upload_and_attach(
+async fn install_fixture_and_attach(
     client: &reqwest::Client,
     base: &str,
+    content_dir: &Path,
     recipe: &Value,
+    reference: &str,
     bytes: Vec<u8>,
 ) -> (Value, Vec<u8>) {
-    let uploaded = client
-        .post(format!("{base}/api/v1/images"))
-        .bearer_auth(TOKEN)
-        .header("content-type", "image/png")
-        .body(bytes)
-        .send()
-        .await
+    use recipe_app::storage::{FileImageStorage, ImageStorage};
+    FileImageStorage::new(content_dir)
+        .put(reference, &bytes)
         .unwrap();
-    assert_eq!(uploaded.status(), 201);
-    let image: Value = uploaded.json().await.unwrap();
-    let attached = client
-        .post(format!(
-            "{base}/api/v1/recipes/{}/image",
-            recipe["id"].as_str().unwrap()
-        ))
-        .bearer_auth(TOKEN)
-        .json(&json!({"base_revision":recipe["revision"],"image_ref":image["ref"]}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(attached.status(), 200);
-    let attached: Value = attached.json().await.unwrap();
+    let attached = mcp::tool(
+        client,
+        base,
+        TOKEN,
+        "attach_image",
+        json!({"id": recipe["id"], "base_revision":recipe["revision"],"image_ref":reference}),
+    )
+    .await;
     let raw = client
-        .get(format!("{base}{}", image["url"].as_str().unwrap()))
+        .get(format!("{base}/images/{reference}"))
         .send()
         .await
         .unwrap()
@@ -133,7 +128,7 @@ async fn upload_and_attach(
         .await
         .unwrap()
         .to_vec();
-    assert_eq!(attached["image"]["ref"], image["ref"]);
+    assert_eq!(attached["image"]["ref"], reference);
     (attached, raw)
 }
 
@@ -147,35 +142,56 @@ async fn documented_backup_restore_recovers_actual_app_history_and_image_bytes()
     let client = reqwest::Client::new();
     let base = source_app.base_url();
 
-    let created = client
-        .post(format!("{base}/api/v1/recipes"))
-        .bearer_auth(TOKEN)
-        .json(&json!({"title":"Backup test soup","servings":2,"body":"@salt{1%g}"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(created.status(), 201);
-    let created: Value = created.json().await.unwrap();
+    let draft = mcp::tool(
+        &client,
+        &base,
+        TOKEN,
+        "save_draft",
+        json!({
+            "document":{"title":"Backup test soup","servings":2,"body":"@salt{1%g}"}
+        }),
+    )
+    .await;
+    let created = mcp::tool(
+        &client,
+        &base,
+        TOKEN,
+        "publish_draft",
+        json!({
+            "id":draft["id"],"expected_revision":draft["revision"]
+        }),
+    )
+    .await;
     let recipe = created["recipe"].clone();
-    let (historical, old_image_bytes) =
-        upload_and_attach(&client, &base, &recipe, png([210, 20, 30])).await;
-    let (current, current_image_bytes) =
-        upload_and_attach(&client, &base, &historical, png([20, 30, 210])).await;
+    let (historical, old_image_bytes) = install_fixture_and_attach(
+        &client,
+        &base,
+        &live.join("content"),
+        &recipe,
+        "img_old",
+        jpeg([210, 20, 30]),
+    )
+    .await;
+    let (current, current_image_bytes) = install_fixture_and_attach(
+        &client,
+        &base,
+        &live.join("content"),
+        &historical,
+        "img_new",
+        jpeg([20, 30, 210]),
+    )
+    .await;
     assert_ne!(old_image_bytes, current_image_bytes);
 
-    let revisions: Vec<Value> = client
-        .get(format!(
-            "{base}/api/v1/recipes/{}/revisions",
-            recipe["id"].as_str().unwrap()
-        ))
-        .bearer_auth(TOKEN)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(revisions.len(), 3);
+    let revisions = mcp::tool(
+        &client,
+        &base,
+        TOKEN,
+        "list_revisions",
+        json!({"id":recipe["id"]}),
+    )
+    .await;
+    assert_eq!(revisions.as_array().unwrap().len(), 3);
     assert_eq!(revisions[1]["image"]["ref"], historical["image"]["ref"]);
     assert_eq!(revisions[2]["image"]["ref"], current["image"]["ref"]);
 
@@ -212,32 +228,24 @@ async fn documented_backup_restore_recovers_actual_app_history_and_image_bytes()
 
     let restored_app = RunningApp::start(&restored).await;
     let restored_base = restored_app.base_url();
-    let restored_current: Value = client
-        .get(format!(
-            "{restored_base}/api/v1/recipes/{}",
-            recipe["id"].as_str().unwrap()
-        ))
-        .bearer_auth(TOKEN)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let restored_current = mcp::tool(
+        &client,
+        &restored_base,
+        TOKEN,
+        "get_recipe",
+        json!({"id":recipe["id"]}),
+    )
+    .await;
     assert_eq!(restored_current["revision"], current["revision"]);
     assert_eq!(restored_current["image"]["ref"], current["image"]["ref"]);
-    let restored_revisions: Vec<Value> = client
-        .get(format!(
-            "{restored_base}/api/v1/recipes/{}/revisions",
-            recipe["id"].as_str().unwrap()
-        ))
-        .bearer_auth(TOKEN)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let restored_revisions = mcp::tool(
+        &client,
+        &restored_base,
+        TOKEN,
+        "list_revisions",
+        json!({"id":recipe["id"]}),
+    )
+    .await;
     assert_eq!(restored_revisions, revisions);
     let old_reference = historical["image"]["ref"].as_str().unwrap();
     let new_reference = current["image"]["ref"].as_str().unwrap();

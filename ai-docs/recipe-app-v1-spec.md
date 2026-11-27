@@ -1,7 +1,7 @@
 # Recipe App — v1 Implementation Spec
 
-Status: ready for implementation (vertical slice / first version)
-Audience: implementing coding agents
+Status: historical v1 design; superseded by the current implementation and README.
+This document describes the v1 REST API and is not current guidance.
 
 ## 1. Purpose
 

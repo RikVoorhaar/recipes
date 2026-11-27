@@ -6,47 +6,12 @@ This directory contains the Stage 4 bundle: `manifest.json` contains ten structu
 
 The ten covers were generated sequentially with OpenRouter Images API `POST /api/v1/images`, model `black-forest-labs/flux-3-image-klein`. Requests contained only `model` and `prompt`. The API key was read privately from the ignored `.env` and is not included here. Covers are distinct JPEGs, resized to at most 1600×1600; no retries or additional generations were made.
 
-## Seed safely
+## Historical seeding
 
-`scripts/seed_stage4.py` is dry-run by default. It requires an explicit target and token file, disables environment proxies, refuses redirects, and only permits localhost by default. The single remote exception is the exact Tailscale preview URL `http://100.81.11.110:38080`, which requires `--allow-preview`; that opt-in does not change dry-run into a write.
-
-Use the locally stored token file; do not paste or print its contents. For the configured preview token:
-
-```sh
-TOKEN_FILE="$HOME/.config/recipe-preview.token"
-chmod 600 "$TOKEN_FILE"
-
-# Safe, read-only preview.
-python3 scripts/seed_stage4.py \
-  --base-url http://100.81.11.110:38080 \
-  --token-file "$TOKEN_FILE" \
-  --allow-preview
-
-# Apply only when publication is explicitly authorized. Use the verified
-# existing Chicken Soup ID; never paste or print the token.
-python3 scripts/seed_stage4.py \
-  --base-url http://100.81.11.110:38080 \
-  --token-file "$TOKEN_FILE" \
-  --allow-preview \
-  --apply \
-  --existing-soup-id VERIFIED_CHICKEN_SOUP_ID
-```
-
-For an isolated localhost instance, use the token file configured for that instance:
-
-```sh
-python3 scripts/seed_stage4.py \
-  --base-url http://127.0.0.1:38145 \
-  --token-file /secure/path/to/isolated.token
-python3 scripts/seed_stage4.py \
-  --base-url http://127.0.0.1:38145 \
-  --token-file /secure/path/to/isolated.token \
-  --apply
-```
-
-The user explicitly authorized immediate publication. The parent operator verified all ten recipes on the pinned Tailscale preview through listing and detail responses, including ten distinct working images. A subsequent dry-run skipped all ten. Do not repeat live writes or restart the preview as part of this work. The script rechecks exact titles before each upload, skips existing titles on every retry, and refuses ambiguous title matches.
-
-For new recipes the supported flow is upload → validate with the uploaded `image_ref` → create → attach with the create response's `base_revision` (two immutable revisions). If attachment fails, the script reports the recipe ID, initial revision and image ref plus safe recovery steps; it never retries or overwrites that title. Chicken Soup is created normally on a fresh target. Attaching to an existing soup requires `--existing-soup-id ID`; the script checks the exact source body and empty image before upload, then attaches against the latest revision. Edited soup and any soup with an existing image are no-ops.
+The original one-off REST seeding script has been removed. The bundle remains
+as provenance, not as an instruction to publish or overwrite recipes. Recipe
+authoring now follows the draft and publication workflow described in the
+project README.
 
 ## Checks
 

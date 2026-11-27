@@ -1,6 +1,6 @@
 # Recipe App v1 — Staged Implementation Plan
 
-[The v1 spec](recipe-app-v1-spec.md) is authoritative. This plan sequences the work; it does not replace the spec or prescribe a database schema. Each stage should be mergeable on its own. A stage is done when its listed checks pass against a fresh temporary database and content directory, where applicable, and the repository-wide checks remain green.
+Historical plan: the v1 spec is superseded. This file records the original staged work and is not current implementation guidance.
 
 ## Handoff and execution
 

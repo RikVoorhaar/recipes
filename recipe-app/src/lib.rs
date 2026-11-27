@@ -8,15 +8,11 @@ mod recipe_web;
 pub mod storage;
 
 use axum::{
-    body::Bytes,
-    extract::{
-        rejection::{BytesRejection, JsonRejection},
-        Path, Query, State,
-    },
-    http::{header::AUTHORIZATION, HeaderMap, HeaderValue, StatusCode},
+    extract::{Path, Query, State},
+    http::{HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use cooklang::CooklangParser;
@@ -104,7 +100,7 @@ pub fn app_with_mcp_origins(
     cover_generator: Option<Arc<Generator>>,
     allowed_origins: Vec<String>,
 ) -> Router {
-    api_router(pool, images, cover_generator, allowed_origins)
+    app_router(pool, images, cover_generator, allowed_origins)
 }
 
 pub async fn configure_tokens(pool: &SqlitePool, tokens: &[String]) -> Result<(), sqlx::Error> {
@@ -124,7 +120,7 @@ pub async fn configure_tokens(pool: &SqlitePool, tokens: &[String]) -> Result<()
     tx.commit().await
 }
 
-fn api_router(
+fn app_router(
     pool: SqlitePool,
     images: Arc<dyn ImageStorage>,
     cover_generator: Option<Arc<Generator>>,
@@ -137,6 +133,7 @@ fn api_router(
             "/mcp",
             post(mcp_http::post).options(|| async { StatusCode::NO_CONTENT }),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(
             state.mcp_allowed_origins.clone(),
             mcp_http::check_origin,
@@ -144,23 +141,6 @@ fn api_router(
     Router::new()
         .merge(mcp_router)
         .route("/health", get(health))
-        .route("/api/v1/openapi.yaml", get(openapi))
-        .route("/api/v1/guidelines", get(guidelines))
-        .route("/api/v1/drafts", get(api_list_drafts).post(api_save_draft))
-        .route(
-            "/api/v1/drafts/:id",
-            get(api_get_draft).delete(api_discard_draft),
-        )
-        .route("/api/v1/drafts/:id/publish", post(api_publish_draft))
-        .route("/api/v1/drafts/:id/cover", post(api_generate_draft_cover))
-        .route(
-            "/api/v1/drafts/:id/covers/:image_ref",
-            get(api_get_draft_cover),
-        )
-        .route("/api/v1/recipes", get(api_list_recipes).post(create_recipe))
-        .route("/api/v1/recipes/:id/scaled", get(scaled_recipe))
-        .route("/api/v1/recipes/:id/pdf", get(api_recipe_pdf))
-        .route("/api/v1/recipes/validate", post(api_validate_recipe))
         .route("/", get(public_index))
         .route("/recipes", get(public_index))
         .route("/ingredients", get(public_ingredients))
@@ -168,37 +148,7 @@ fn api_router(
         .route("/assets/Lora.ttf", get(public_font))
         .route("/tags/:tag", get(public_tag))
         .route("/recipes/:id", get(public_recipe))
-        .route("/api/v1/search", get(api_search_recipes))
-        .route("/api/v1/images", post(upload_image))
         .route("/images/:ref", get(get_image))
-        .route(
-            "/api/v1/recipes/:id/image",
-            post(api_attach_image).delete(detach_image),
-        )
-        .route("/api/v1/recipes/:id/cover", post(api_generate_recipe_cover))
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
-        .route("/api/v1/tags", get(api_list_tags))
-        .route("/api/v1/ingredients", get(api_list_ingredients))
-        .route(
-            "/api/v1/ingredients/:id",
-            get(api_get_ingredient).put(api_rename_ingredient),
-        )
-        .route("/api/v1/ingredients/:id/aliases", post(api_add_alias))
-        .route(
-            "/api/v1/ingredients/:id/aliases/:alias",
-            delete(api_remove_alias),
-        )
-        .route("/api/v1/ingredients/:id/merge", post(api_merge_ingredient))
-        .route(
-            "/api/v1/recipes/:id",
-            get(api_get_recipe).put(update_recipe).delete(delete_recipe),
-        )
-        .route("/api/v1/recipes/:id/restore", post(restore_recipe))
-        .route("/api/v1/recipes/:id/revisions", get(api_list_revisions))
-        .route(
-            "/api/v1/recipes/:id/revisions/:revision",
-            get(api_get_revision).post(restore_revision),
-        )
         .layer(middleware::from_fn(log_request))
         .with_state(state)
 }
@@ -259,8 +209,6 @@ impl IntoResponse for ApiError {
             "unauthorized" => StatusCode::UNAUTHORIZED,
             "not_found" => StatusCode::NOT_FOUND,
             "conflict" => StatusCode::CONFLICT,
-            "payload_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
-            "invalid_json" => StatusCode::BAD_REQUEST,
             "cooklang_invalid"
             | "cooklang_metadata_forbidden"
             | "invalid_request"
@@ -272,40 +220,13 @@ impl IntoResponse for ApiError {
     }
 }
 
-impl From<JsonRejection> for ApiError {
-    fn from(_: JsonRejection) -> Self {
-        Self::new(
-            "invalid_json",
-            "The request body must be valid JSON matching the endpoint schema",
-        )
-    }
-}
-
 fn token_hash(secret: &str) -> String {
     format!("{:x}", Sha256::digest(secret.as_bytes()))
-}
-
-async fn authorize(state: &RecipeService, headers: &HeaderMap) -> Result<String, ApiError> {
-    authorize_identity(state, headers)
-        .await
-        .map(|caller| caller.label)
 }
 
 struct CallerIdentity {
     label: String,
     token_hash: String,
-}
-
-async fn authorize_identity(
-    state: &RecipeService,
-    headers: &HeaderMap,
-) -> Result<CallerIdentity, ApiError> {
-    let value = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| ApiError::new("unauthorized", "A bearer token is required"))?;
-    authorize_secret(state, value).await
 }
 
 async fn authorize_secret(state: &RecipeService, value: &str) -> Result<CallerIdentity, ApiError> {
@@ -380,8 +301,6 @@ pub struct RecipeWrite {
     #[serde(default)]
     pub notes: Option<String>,
     pub body: String,
-    #[serde(default)]
-    pub base_revision: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -487,22 +406,6 @@ impl RevisionRow {
 }
 
 const REVISION_COLUMNS: &str = "r.id, r.recipe_id, r.created_at, r.author_label, r.title, r.description, r.servings, r.tags, r.source_url, r.notes, r.body, r.deleted, r.image_ref";
-
-async fn api_save_draft(
-    State(state): State<RecipeService>,
-    headers: HeaderMap,
-    request: Result<Json<DraftWrite>, JsonRejection>,
-) -> Result<(StatusCode, Json<DraftDocument>), ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let Json(write) = request?;
-    let draft = save_draft(&state, &caller, write).await?;
-    let status = if draft.revision == 1 {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    Ok((status, Json(draft)))
-}
 
 async fn save_draft(
     state: &RecipeService,
@@ -631,15 +534,6 @@ async fn save_draft(
     })
 }
 
-async fn api_get_draft(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<DraftDocument>, ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    get_draft(&state, &caller, &id).await.map(Json)
-}
-
 async fn get_draft(
     state: &RecipeService,
     caller: &CallerIdentity,
@@ -651,14 +545,6 @@ async fn get_draft(
     row.document()
 }
 
-async fn api_list_drafts(
-    State(state): State<RecipeService>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<DraftDocument>>, ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    list_drafts(&state, &caller).await.map(Json)
-}
-
 async fn list_drafts(
     state: &RecipeService,
     caller: &CallerIdentity,
@@ -668,18 +554,6 @@ async fn list_drafts(
     rows.into_iter()
         .map(|row| row.document())
         .collect::<Result<Vec<_>, _>>()
-}
-
-async fn api_discard_draft(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<ExpectedDraftRevision>, JsonRejection>,
-) -> Result<StatusCode, ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let Json(revision) = request?;
-    discard_draft(&state, &caller, &id, revision).await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn discard_draft(
@@ -709,18 +583,6 @@ async fn discard_draft(
         ));
     }
     Ok(())
-}
-
-async fn api_publish_draft(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<DraftRevision>, JsonRejection>,
-) -> Result<(StatusCode, Json<SaveResult>), ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let Json(expected) = request?;
-    let result = publish_draft(&state, &caller, &id, expected).await?;
-    Ok((StatusCode::OK, Json(result)))
 }
 
 async fn publish_draft(
@@ -888,161 +750,6 @@ async fn publish_draft(
     Ok(SaveResult { recipe, warnings })
 }
 
-async fn create_recipe(
-    State(state): State<RecipeService>,
-    headers: HeaderMap,
-    request: Result<Json<RecipeWrite>, JsonRejection>,
-) -> Result<(StatusCode, Json<SaveResult>), ApiError> {
-    let author = authorize(&state, &headers).await?;
-    let Json(write) = request?;
-    let warnings = state.parse_body(&write.body)?;
-    validate_write(&write)?;
-    let id = new_id("rcp");
-    let revision_id = new_id("rev");
-    let created_at = now();
-    let mut tx = state.pool.begin().await.map_err(internal_error)?;
-    sqlx::query("INSERT INTO recipes(id, current_revision_id) VALUES (?, ?)")
-        .bind(&id)
-        .bind(&revision_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal_error)?;
-    insert_revision(
-        &mut tx,
-        &revision_id,
-        &id,
-        &created_at,
-        &author,
-        &write,
-        false,
-        None,
-    )
-    .await?;
-    derive_revision(&mut tx, &revision_id, &write.body, &author).await?;
-    tx.commit().await.map_err(internal_error)?;
-    let recipe = fetch_revision(&state.pool, &id, &revision_id)
-        .await?
-        .document();
-    Ok((StatusCode::CREATED, Json(SaveResult { recipe, warnings })))
-}
-
-async fn update_recipe(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<RecipeWrite>, JsonRejection>,
-) -> Result<Json<SaveResult>, ApiError> {
-    let author = authorize(&state, &headers).await?;
-    let Json(write) = request?;
-    let base = write
-        .base_revision
-        .as_deref()
-        .ok_or_else(|| ApiError::new("invalid_request", "base_revision is required for updates"))?;
-    ensure_current_base(&state.pool, &id, base).await?;
-    let current = fetch_revision(&state.pool, &id, base).await?;
-    let image_ref = current.image_ref.clone();
-    let revision_id = new_id("rev");
-    let created_at = now();
-    let mut tx = state.pool.begin().await.map_err(internal_error)?;
-    let result = sqlx::query(
-        "UPDATE recipes SET current_revision_id = ? WHERE id = ? AND current_revision_id = ? AND deleted = 0",
-    )
-    .bind(&revision_id)
-    .bind(&id)
-    .bind(base)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal_error)?;
-    if result.rows_affected() == 0 {
-        tx.rollback().await.map_err(internal_error)?;
-        return Err(conflict_error(
-            &state.pool,
-            &id,
-            "The recipe changed, was deleted, or does not exist",
-        )
-        .await?);
-    }
-    if let Err(error) = validate_write(&write) {
-        tx.rollback().await.map_err(internal_error)?;
-        return Err(error);
-    }
-    let warnings = match state.parse_body(&write.body) {
-        Ok(warnings) => warnings,
-        Err(error) => {
-            tx.rollback().await.map_err(internal_error)?;
-            return Err(error);
-        }
-    };
-    insert_revision(
-        &mut tx,
-        &revision_id,
-        &id,
-        &created_at,
-        &author,
-        &write,
-        false,
-        image_ref.as_deref(),
-    )
-    .await?;
-    derive_revision(&mut tx, &revision_id, &write.body, &author).await?;
-    tx.commit().await.map_err(internal_error)?;
-    let recipe = fetch_revision(&state.pool, &id, &revision_id)
-        .await?
-        .document();
-    Ok(Json(SaveResult { recipe, warnings }))
-}
-
-async fn delete_recipe(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<BaseRevision>, JsonRejection>,
-) -> Result<Json<RecipeDocument>, ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let Json(request) = request?;
-    append_state_revision(&state, &caller, &id, &request.base_revision, true, None)
-        .await
-        .map(Json)
-}
-
-#[derive(Deserialize)]
-struct BaseRevision {
-    base_revision: String,
-}
-
-async fn restore_recipe(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<BaseRevision>, JsonRejection>,
-) -> Result<Json<RecipeDocument>, ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let Json(request) = request?;
-    append_state_revision(&state, &caller, &id, &request.base_revision, false, None)
-        .await
-        .map(Json)
-}
-
-async fn restore_revision(
-    State(state): State<RecipeService>,
-    Path((id, revision)): Path<(String, String)>,
-    headers: HeaderMap,
-    request: Result<Json<BaseRevision>, JsonRejection>,
-) -> Result<Json<RecipeDocument>, ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let Json(request) = request?;
-    append_state_revision(
-        &state,
-        &caller,
-        &id,
-        &request.base_revision,
-        false,
-        Some(&revision),
-    )
-    .await
-    .map(Json)
-}
-
 async fn append_state_revision(
     state: &RecipeService,
     caller: &CallerIdentity,
@@ -1069,7 +776,7 @@ async fn append_state_revision(
         tx.rollback().await.map_err(internal_error)?;
         return Err(conflict_error(&state.pool, id, "The recipe changed or does not exist").await?);
     }
-    let mut write = RecipeWrite {
+    let write = RecipeWrite {
         title: source.title,
         description: source.description,
         servings: source.servings as u32,
@@ -1077,7 +784,6 @@ async fn append_state_revision(
         source_url: source.source_url,
         notes: source.notes,
         body: source.body,
-        base_revision: None,
     };
     insert_revision(
         &mut tx,
@@ -1099,18 +805,9 @@ async fn append_state_revision(
     )
     .await?;
     tx.commit().await.map_err(internal_error)?;
-    write.base_revision = None;
     Ok(fetch_revision(&state.pool, id, &revision_id)
         .await?
         .document())
-}
-
-async fn api_list_recipes(
-    State(state): State<RecipeService>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<RecipeDocument>>, ApiError> {
-    authorize(&state, &headers).await?;
-    list_recipes(&state).await.map(Json)
 }
 
 async fn list_recipes(state: &RecipeService) -> Result<Vec<RecipeDocument>, ApiError> {
@@ -1120,15 +817,6 @@ async fn list_recipes(state: &RecipeService) -> Result<Vec<RecipeDocument>, ApiE
         .await
         .map_err(internal_error)?;
     Ok(rows.into_iter().map(RevisionRow::document).collect())
-}
-
-async fn api_get_recipe(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<RecipeDocument>, ApiError> {
-    authorize(&state, &headers).await?;
-    get_recipe(&state, &id).await.map(Json)
 }
 
 async fn get_recipe(state: &RecipeService, id: &str) -> Result<RecipeDocument, ApiError> {
@@ -1462,36 +1150,6 @@ fn format_quantity_number(number: &cooklang::quantity::Number) -> String {
     fraction.map_or_else(|| value.to_string(), |fraction| fraction.to_string())
 }
 
-async fn scaled_recipe(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    Query(query): Query<ServingQuery>,
-) -> Result<Json<ScaledRecipe>, ApiError> {
-    authorize(&state, &headers).await?;
-    let row = fetch_current(&state.pool, &id).await?;
-    if row.deleted != 0 {
-        return Err(ApiError::new("not_found", "Recipe not found"));
-    }
-    let target = query.servings.unwrap_or(row.servings as u32);
-    Ok(Json(scaled_view(&state, &row, target)?))
-}
-
-async fn api_recipe_pdf(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    Query(query): Query<ServingQuery>,
-) -> Result<Response, ApiError> {
-    authorize(&state, &headers).await?;
-    let row = fetch_current(&state.pool, &id).await?;
-    if row.deleted != 0 {
-        return Err(ApiError::new("not_found", "Recipe not found"));
-    }
-    let target = query.servings.unwrap_or(row.servings as u32);
-    render_pdf_response(&state, scaled_view(&state, &row, target)?).await
-}
-
 async fn render_pdf_response(
     state: &RecipeService,
     view: ScaledRecipe,
@@ -1549,16 +1207,6 @@ struct ValidationRequest {
     image_ref: Option<String>,
 }
 
-async fn api_validate_recipe(
-    State(state): State<RecipeService>,
-    headers: HeaderMap,
-    request: Result<Json<ValidationRequest>, JsonRejection>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers).await?;
-    let Json(request) = request?;
-    validate_recipe(&state, request).await.map(Json)
-}
-
 async fn validate_recipe(
     state: &RecipeService,
     request: ValidationRequest,
@@ -1572,7 +1220,6 @@ async fn validate_recipe(
         source_url: request.source_url.clone(),
         notes: request.notes.clone(),
         body: request.body.clone(),
-        base_revision: None,
     };
     validate_write(&write)?;
     if let Some(image_ref) = request.image_ref.as_deref() {
@@ -1976,15 +1623,6 @@ async fn public_rows(state: &RecipeService) -> Result<Vec<RevisionRow>, ApiError
         .fetch_all(&state.pool).await.map_err(internal_error)
 }
 
-async fn api_list_revisions(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<RecipeDocument>>, ApiError> {
-    authorize(&state, &headers).await?;
-    list_revisions(&state, &id).await.map(Json)
-}
-
 async fn list_revisions(state: &RecipeService, id: &str) -> Result<Vec<RecipeDocument>, ApiError> {
     let query = format!("SELECT {REVISION_COLUMNS} FROM recipe_revisions r WHERE r.recipe_id = ? ORDER BY r.created_at, r.id");
     let rows = sqlx::query_as::<_, RevisionRow>(&query)
@@ -1998,15 +1636,6 @@ async fn list_revisions(state: &RecipeService, id: &str) -> Result<Vec<RecipeDoc
     Ok(rows.into_iter().map(RevisionRow::document).collect())
 }
 
-async fn api_get_revision(
-    State(state): State<RecipeService>,
-    Path((id, revision)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<Json<RecipeDocument>, ApiError> {
-    authorize(&state, &headers).await?;
-    get_revision(&state, &id, &revision).await.map(Json)
-}
-
 async fn get_revision(
     state: &RecipeService,
     id: &str,
@@ -2017,33 +1646,6 @@ async fn get_revision(
 
 const RECIPE_GUIDELINES: &str = include_str!("../guidelines/recipe-writing.md");
 
-async fn guidelines(
-    State(state): State<RecipeService>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize(&state, &headers).await?;
-    Ok((
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/markdown; charset=utf-8",
-        )],
-        RECIPE_GUIDELINES,
-    ))
-}
-
-async fn openapi() -> impl IntoResponse {
-    (
-        [(axum::http::header::CONTENT_TYPE, "application/yaml")],
-        include_str!("../../openapi.yaml"),
-    )
-}
-
-#[derive(Serialize)]
-struct UploadedImage {
-    r#ref: String,
-    url: String,
-}
-
 #[derive(Deserialize)]
 struct GenerateDraftCover {
     expected_revision: i64,
@@ -2053,7 +1655,6 @@ struct GenerateDraftCover {
 #[derive(Serialize)]
 struct DraftCoverCandidate {
     image_ref: String,
-    preview_url: String,
 }
 
 #[derive(Deserialize)]
@@ -2062,18 +1663,6 @@ struct GenerateRecipeCover {
     dish_description: String,
     #[serde(default)]
     replace: bool,
-}
-
-async fn api_generate_draft_cover(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<GenerateDraftCover>, JsonRejection>,
-) -> Result<(StatusCode, Json<DraftCoverCandidate>), ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let Json(request) = request?;
-    let result = generate_draft_cover(&state, &caller, &id, request).await?;
-    Ok((StatusCode::CREATED, Json(result)))
 }
 
 async fn generate_draft_cover(
@@ -2152,26 +1741,8 @@ async fn generate_draft_cover(
         .execute(&mut *tx).await.map_err(internal_error)?;
     tx.commit().await.map_err(internal_error)?;
     Ok(DraftCoverCandidate {
-        image_ref: reference.clone(),
-        preview_url: format!("/api/v1/drafts/{id}/covers/{reference}"),
+        image_ref: reference,
     })
-}
-
-async fn api_get_draft_cover(
-    State(state): State<RecipeService>,
-    Path((id, reference)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let bytes = get_draft_cover(&state, &caller, &id, &reference).await?;
-    Ok((
-        [
-            (axum::http::header::CONTENT_TYPE, GENERATED_COVER_MIME),
-            (axum::http::header::CACHE_CONTROL, "private, no-store"),
-        ],
-        bytes,
-    )
-        .into_response())
 }
 
 async fn get_draft_cover(
@@ -2210,19 +1781,6 @@ async fn get_draft_cover(
             internal_error(error)
         }
     })
-}
-
-async fn api_generate_recipe_cover(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<GenerateRecipeCover>, JsonRejection>,
-) -> Result<Json<RecipeDocument>, ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let Json(request) = request?;
-    generate_recipe_cover(&state, &caller, &id, request)
-        .await
-        .map(Json)
 }
 
 async fn generate_recipe_cover(
@@ -2300,19 +1858,10 @@ fn normalize_generated_image(bytes: Vec<u8>) -> Result<Vec<u8>, &'static str> {
     Ok(output.into_inner())
 }
 
-async fn upload_image(
-    State(state): State<RecipeService>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Result<(StatusCode, Json<UploadedImage>), ApiError> {
-    authorize(&state, &headers).await?;
-    let body = body.map_err(|rejection| {
-        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::new("payload_too_large", "Image upload exceeds the 10 MiB limit")
-        } else {
-            ApiError::new("invalid_image", "Image request body could not be read")
-        }
-    })?;
+// Retain upload validation coverage as a test-only seam until upload support is
+// designed separately; it is not exposed by MCP or the web application.
+#[cfg(test)]
+fn normalize_uploaded_image(content_type: &str, body: &[u8]) -> Result<Vec<u8>, ApiError> {
     const MAX_UPLOAD: usize = 10 * 1024 * 1024;
     if body.is_empty() || body.len() > MAX_UPLOAD {
         return Err(ApiError::new(
@@ -2320,10 +1869,6 @@ async fn upload_image(
             "Image must be non-empty and no larger than 10 MiB",
         ));
     }
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
     if !matches!(
         content_type.split(';').next().unwrap_or("").trim(),
         "image/jpeg" | "image/png" | "image/webp"
@@ -2333,7 +1878,7 @@ async fn upload_image(
             "Accepted image types are JPEG, PNG, and WebP",
         ));
     }
-    let reader = image::ImageReader::new(io::Cursor::new(&body))
+    let reader = image::ImageReader::new(io::Cursor::new(body))
         .with_guessed_format()
         .map_err(|_| ApiError::new("invalid_image", "Image format could not be read"))?;
     let decoded_format = reader
@@ -2371,18 +1916,59 @@ async fn upload_image(
     normalized
         .write_to(&mut encoded, image::ImageFormat::Jpeg)
         .map_err(internal_error)?;
-    let reference = new_id("img");
-    state
-        .images
-        .put(&reference, encoded.get_ref())
-        .map_err(internal_error)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(UploadedImage {
-            url: format!("/images/{reference}"),
-            r#ref: reference,
-        }),
-    ))
+    Ok(encoded.into_inner())
+}
+
+#[cfg(test)]
+mod upload_image_tests {
+    use super::normalize_uploaded_image;
+    use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, RgbImage};
+    use std::io::Cursor;
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, Rgb([220, 30, 40])))
+            .write_to(&mut output, ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
+    }
+
+    #[test]
+    fn upload_validation_and_normalization() {
+        let bytes = png(1800, 900);
+        for (mime, body) in [
+            ("image/gif", bytes.as_slice()),
+            ("image/jpeg", bytes.as_slice()),
+            ("image/png", b"not an image".as_slice()),
+            ("image/png", b"".as_slice()),
+        ] {
+            assert_eq!(
+                normalize_uploaded_image(mime, body).unwrap_err().code,
+                "invalid_image"
+            );
+        }
+        assert_eq!(
+            normalize_uploaded_image("image/png", &vec![0; 10 * 1024 * 1024 + 1])
+                .unwrap_err()
+                .code,
+            "invalid_image"
+        );
+        let normalized = normalize_uploaded_image("image/png", &bytes).unwrap();
+        assert_eq!(&normalized[..2], &[0xff, 0xd8]);
+        assert_eq!(
+            image::load_from_memory(&normalized).unwrap().dimensions(),
+            (1600, 800)
+        );
+    }
+
+    #[test]
+    fn upload_accepts_exact_sixteen_megapixels() {
+        let normalized = normalize_uploaded_image("image/png", &png(4000, 4000)).unwrap();
+        assert_eq!(
+            image::load_from_memory(&normalized).unwrap().dimensions(),
+            (1600, 1600)
+        );
+    }
 }
 
 async fn get_image(
@@ -2437,17 +2023,6 @@ struct AttachImage {
     image_ref: String,
 }
 
-async fn api_attach_image(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<AttachImage>, JsonRejection>,
-) -> Result<Json<RecipeDocument>, ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let Json(request) = request?;
-    attach_image(&state, &caller, &id, request).await.map(Json)
-}
-
 async fn attach_image(
     state: &RecipeService,
     caller: &CallerIdentity,
@@ -2479,19 +2054,6 @@ async fn attach_image(
         Some(&request.image_ref),
     )
     .await
-}
-
-async fn detach_image(
-    State(state): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<BaseRevision>, JsonRejection>,
-) -> Result<Json<RecipeDocument>, ApiError> {
-    let caller = authorize_identity(&state, &headers).await?;
-    let Json(request) = request?;
-    append_image_revision(&state, &caller, &id, &request.base_revision, None)
-        .await
-        .map(Json)
 }
 
 async fn append_image_revision(
@@ -2526,7 +2088,6 @@ async fn append_image_revision(
         source_url: source.source_url.clone(),
         notes: source.notes.clone(),
         body: source.body.clone(),
-        base_revision: None,
     };
     insert_revision(
         &mut tx,
@@ -2706,15 +2267,6 @@ struct IngredientQuery {
     q: Option<String>,
 }
 
-async fn api_list_ingredients(
-    State(s): State<RecipeService>,
-    headers: HeaderMap,
-    Query(q): Query<IngredientQuery>,
-) -> Result<Json<Vec<IngredientSummary>>, ApiError> {
-    authorize(&s, &headers).await?;
-    list_ingredients(&s, q).await.map(Json)
-}
-
 async fn list_ingredients(
     s: &RecipeService,
     q: IngredientQuery,
@@ -2730,15 +2282,6 @@ struct IngredientDetail {
     id: String,
     name: String,
     usage_count: i64,
-}
-
-async fn api_get_ingredient(
-    State(s): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&s, &headers).await?;
-    get_ingredient(&s, &id).await.map(Json)
 }
 
 async fn get_ingredient(s: &RecipeService, id: &str) -> Result<serde_json::Value, ApiError> {
@@ -2762,18 +2305,6 @@ struct AliasBody {
 #[derive(Deserialize)]
 struct MergeBody {
     survivor: String,
-}
-
-async fn api_rename_ingredient(
-    State(s): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<NameBody>, JsonRejection>,
-) -> Result<StatusCode, ApiError> {
-    let caller = authorize_identity(&s, &headers).await?;
-    let Json(b) = request?;
-    rename_ingredient(&s, &caller, &id, b).await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn rename_ingredient(
@@ -2815,18 +2346,6 @@ async fn rename_ingredient(
     Ok(())
 }
 
-async fn api_add_alias(
-    State(s): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<AliasBody>, JsonRejection>,
-) -> Result<StatusCode, ApiError> {
-    let caller = authorize_identity(&s, &headers).await?;
-    let Json(b) = request?;
-    add_alias(&s, &caller, &id, b).await?;
-    Ok(StatusCode::CREATED)
-}
-
 async fn add_alias(
     s: &RecipeService,
     caller: &CallerIdentity,
@@ -2866,16 +2385,6 @@ async fn add_alias(
     Ok(())
 }
 
-async fn api_remove_alias(
-    State(s): State<RecipeService>,
-    Path((id, alias)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<StatusCode, ApiError> {
-    let caller = authorize_identity(&s, &headers).await?;
-    remove_alias(&s, &caller, &id, &alias).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 async fn remove_alias(
     s: &RecipeService,
     caller: &CallerIdentity,
@@ -2896,18 +2405,6 @@ async fn remove_alias(
     history(&mut tx, id, "alias_removed", alias, "{}", &caller.label).await?;
     tx.commit().await.map_err(internal_error)?;
     Ok(())
-}
-
-async fn api_merge_ingredient(
-    State(s): State<RecipeService>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    request: Result<Json<MergeBody>, JsonRejection>,
-) -> Result<StatusCode, ApiError> {
-    let caller = authorize_identity(&s, &headers).await?;
-    let Json(b) = request?;
-    merge_ingredient(&s, &caller, &id, b).await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn merge_ingredient(
@@ -3010,14 +2507,6 @@ async fn history(
     Ok(())
 }
 
-async fn api_list_tags(
-    State(s): State<RecipeService>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    authorize(&s, &headers).await?;
-    list_tags(&s).await.map(Json)
-}
-
 async fn list_tags(s: &RecipeService) -> Result<Vec<serde_json::Value>, ApiError> {
     let rows:Vec<(String,i64)>=sqlx::query_as("SELECT j.value,COUNT(DISTINCT p.id) FROM recipes p JOIN recipe_revisions r ON r.id=p.current_revision_id JOIN json_each(r.tags) j WHERE p.deleted=0 GROUP BY j.value ORDER BY j.value COLLATE NOCASE").fetch_all(&s.pool).await.map_err(internal_error)?;
     Ok(rows
@@ -3043,15 +2532,6 @@ struct SearchQuery {
     sort: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
-}
-
-async fn api_search_recipes(
-    State(s): State<RecipeService>,
-    headers: HeaderMap,
-    Query(q): Query<SearchQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    authorize(&s, &headers).await?;
-    search_recipes(&s, q).await.map(Json)
 }
 
 async fn search_recipes(

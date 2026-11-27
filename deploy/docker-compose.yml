@@ -1,6 +1,6 @@
 services:
   recipes:
-    image: ghcr.io/rikvoorhaar/recipes:latest
+    image: ghcr.io/rikvoorhaar/recipes:${RECIPES_IMAGE_TAG:?Set RECIPES_IMAGE_TAG to a published version, e.g. v1.2.3}
     container_name: recipes
     restart: unless-stopped
     env_file: .env

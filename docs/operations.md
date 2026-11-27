@@ -22,6 +22,8 @@ Create `.env` in that directory, restrict it to the deployment operator
 ```dotenv
 # Temporary token configuration pending #15; replace with a strong secret.
 APP__API_TOKENS=owner:replace-with-a-secret
+# Select an existing published version; there is no latest tag.
+RECIPES_IMAGE_TAG=v1.2.3
 # Optional; enables cover generation.
 APP__OPENROUTER_API_KEY=replace-with-provider-key
 # Optional; exact trusted browser origins, comma-separated, no trailing slash.
@@ -43,13 +45,14 @@ After reviewing the file and provisioning secrets and storage, use
 authenticated MCP access. An unauthenticated request to `/mcp` should return
 401. The `recipe-app healthcheck` command probes the configured local listener
 without opening or modifying the database. Migrations run on startup.
-Main builds publish a commit-SHA tag after CI passes. Promotion to `latest` is
-serialized and checks that the commit is still the main tip immediately before
-promotion; obsolete builds and reruns keep their SHA tag but skip `latest`.
-If main advances between the check and promotion, `latest` can briefly lag
-until the newer main build passes and promotes; if that build fails, it remains
-at the last successful promotion. Pin a SHA for reproducible upgrades and
-retain the previous image for rollback.
+Publishing a GitHub release tagged `vMAJOR.MINOR.PATCH` runs checks and then
+builds and publishes that version tag to GHCR. PR and main CI do not build or
+publish an image; the release workflow does not publish `latest` or deploy.
+Select a real published version with `RECIPES_IMAGE_TAG` before running Compose
+and retain the previous version for rollback. Changing the release or version
+does not automatically update a running deployment; deployment is manual.
+For local image verification use `make container-build` (optionally override
+`IMAGE`); this only builds locally.
 Before schema-affecting upgrades, make and verify a consistent backup.
 
 For a derived-data rebuild, stop the service and use the same Compose config
@@ -96,7 +99,7 @@ a nonexistent destination and clears copied API tokens. Readable export/import
 
 ## Verification
 
-Run `scripts/check.sh` and `python3 -m unittest discover -s tests -p
-'ops*_test.py' -v`. These use isolated fixtures. The real VPS certificate,
+Run `make ci` for formatting, all-target Clippy, Rust workspace tests, and
+Python operations tests. These use isolated fixtures. The real VPS certificate,
 proxy setup, and restoration from its backups require separate operator
 verification.

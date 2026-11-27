@@ -2338,7 +2338,12 @@ async fn rename_ingredient(
     if normalized.is_empty() {
         return Err(ApiError::new("invalid_request", "name must not be empty"));
     }
-    let mut tx = s.pool.begin().await.map_err(internal_error)?;
+    // Reserve the writer before reading: WAL cannot upgrade a stale snapshot.
+    let mut tx = s
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(internal_error)?;
     let collision: Option<String>=sqlx::query_scalar("SELECT id FROM ingredients WHERE normalized_name=? AND id<>? UNION SELECT ingredient_id FROM ingredient_aliases WHERE normalized_alias=?").bind(&normalized).bind(id).bind(&normalized).fetch_optional(&mut *tx).await.map_err(internal_error)?;
     if collision.is_some() {
         return Err(ApiError::new(
@@ -2374,7 +2379,11 @@ async fn add_alias(
 ) -> Result<(), ApiError> {
     let alias = b.alias.trim();
     let normalized = normalize(alias);
-    let mut tx = s.pool.begin().await.map_err(internal_error)?;
+    let mut tx = s
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(internal_error)?;
     let exists: Option<String> =
         sqlx::query_scalar("SELECT id FROM ingredients WHERE id=? AND deleted=0")
             .bind(id)
@@ -2434,7 +2443,11 @@ async fn merge_ingredient(
     b: MergeBody,
 ) -> Result<(), ApiError> {
     let survivor = normalize(&b.survivor);
-    let mut tx = s.pool.begin().await.map_err(internal_error)?;
+    let mut tx = s
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(internal_error)?;
     let source: Option<String> =
         sqlx::query_scalar("SELECT name FROM ingredients WHERE id=? AND deleted=0")
             .bind(id)

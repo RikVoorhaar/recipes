@@ -137,17 +137,28 @@ pub fn read_tree(root: &Path) -> Result<(Manifest, BTreeMap<String, Vec<u8>>)> {
 /// Update only paths named by the previous manifest or the new snapshot.
 /// Existing unowned files are never overwritten or removed.
 pub fn write_tree(root: &Path, snapshot: Snapshot) -> Result<()> {
+    write_tree_with_hook(root, snapshot, || Ok(()))
+}
+
+// The hook runs after each filesystem mutation, allowing fault injection at
+// the exact boundary that needs rollback without exposing a runtime switch.
+fn write_tree_with_hook(
+    root: &Path,
+    snapshot: Snapshot,
+    mut after_mutation: impl FnMut() -> io::Result<()>,
+) -> Result<()> {
     safe_path(root)?;
     if root.exists() && !root.is_dir() {
         return Err(invalid("export destination is not a directory"));
     }
     let manifest_path = root.join("manifest.json");
     safe_path(&manifest_path)?;
-    let old: BTreeSet<String> = if manifest_path.exists() {
-        read_tree(root)?.0.files.into_keys().collect()
+    let old_files = if manifest_path.exists() {
+        read_tree(root)?.1
     } else {
-        BTreeSet::new()
+        BTreeMap::new()
     };
+    let old: BTreeSet<String> = old_files.keys().cloned().collect();
     for path in snapshot.files.keys() {
         if !managed(path) {
             return Err(invalid("unsafe managed path"));
@@ -179,24 +190,76 @@ pub fn write_tree(root: &Path, snapshot: Snapshot) -> Result<()> {
         .unwrap_or(Path::new("."));
     safe_path(parent)?;
     let stage = tempfile::tempdir_in(parent)?;
+    let new = stage.path().join("new");
+    let before = stage.path().join("before");
     for (path, bytes) in &snapshot.files {
-        let target = stage.path().join(path);
+        let target = new.join(path);
         fs::create_dir_all(target.parent().unwrap())?;
         fs::write(target, bytes)?;
     }
-    fs::write(stage.path().join("manifest.json"), manifest_bytes)?;
+    fs::write(new.join("manifest.json"), manifest_bytes)?;
+    for (path, bytes) in &old_files {
+        let target = before.join(path);
+        fs::create_dir_all(target.parent().unwrap())?;
+        fs::write(target, bytes)?;
+    }
+    if manifest_path.exists() {
+        fs::create_dir_all(&before)?;
+        fs::copy(&manifest_path, before.join("manifest.json"))?;
+    }
+    // Keep an explicit plan for manual recovery if the filesystem also refuses
+    // rollback (for example because permissions changed during publication).
+    fs::write(
+        stage.path().join("plan.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "old_paths": old,
+            "new_paths": snapshot.files.keys().collect::<Vec<_>>(),
+        }))?,
+    )?;
     fs::create_dir_all(root)?;
-    for path in snapshot.files.keys() {
-        let dest = root.join(path);
-        fs::create_dir_all(dest.parent().unwrap())?;
-        fs::rename(stage.path().join(path), dest)?;
-    }
-    for path in old {
-        if !snapshot.files.contains_key(&path) {
-            fs::remove_file(root.join(path))?;
+    let mut changed = Vec::new();
+    let publication = (|| -> Result<()> {
+        for path in snapshot.files.keys() {
+            let dest = root.join(path);
+            fs::create_dir_all(dest.parent().unwrap())?;
+            fs::rename(new.join(path), dest)?;
+            changed.push(path.clone());
+            after_mutation()?;
         }
+        for path in &old {
+            if !snapshot.files.contains_key(path) {
+                fs::remove_file(root.join(path))?;
+                changed.push(path.clone());
+                after_mutation()?;
+            }
+        }
+        fs::rename(new.join("manifest.json"), manifest_path)?;
+        Ok(())
+    })();
+    if let Err(error) = publication {
+        let mut rollback_errors = Vec::new();
+        for path in changed.iter().rev() {
+            let dest = root.join(path);
+            let result = if old.contains(path) {
+                fs::rename(before.join(path), dest)
+            } else {
+                fs::remove_file(dest)
+            };
+            if let Err(failure) = result {
+                rollback_errors.push(format!("{path}: {failure}"));
+            }
+        }
+        if !rollback_errors.is_empty() {
+            let saved = stage.keep();
+            return Err(io::Error::other(format!(
+                "export failed: {error}; rollback incomplete: {}; recovery data retained at {}",
+                rollback_errors.join(", "),
+                saved.display()
+            ))
+            .into());
+        }
+        return Err(error);
     }
-    fs::rename(stage.path().join("manifest.json"), manifest_path)?;
     Ok(())
 }
 
@@ -454,4 +517,102 @@ pub async fn import_tree(src: &Path, db: &Path, content: &Path) -> Result<()> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    fn snapshot(name: &str, ingredient: &[u8]) -> Snapshot {
+        Snapshot {
+            files: BTreeMap::from([
+                ("ingredients.yaml".into(), ingredient.to_vec()),
+                (
+                    format!("recipes/{name}--rcp_12345678.cook"),
+                    b"body".to_vec(),
+                ),
+            ]),
+            recipes: 1,
+            ingredients: 0,
+        }
+    }
+
+    #[test]
+    fn mid_publication_errors_restore_previous_tree_and_allow_retry() {
+        for fail_after in 1..=3 {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("book");
+            write_tree(&root, snapshot("old", b"old")).unwrap();
+            fs::create_dir(root.join(".git")).unwrap();
+            fs::write(root.join(".git/config"), b"git").unwrap();
+            fs::write(root.join("unrelated"), b"keep").unwrap();
+            let original_manifest = fs::read(root.join("manifest.json")).unwrap();
+            let original = read_tree(&root).unwrap().1;
+            let mut mutations = 0;
+            let result = write_tree_with_hook(&root, snapshot("new", b"new"), || {
+                mutations += 1;
+                if mutations == fail_after {
+                    Err(io::Error::other("injected publication failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                fs::read(root.join("manifest.json")).unwrap(),
+                original_manifest
+            );
+            assert_eq!(read_tree(&root).unwrap().1, original);
+            assert!(!root.join("recipes/new--rcp_12345678.cook").exists());
+            assert_eq!(fs::read(root.join(".git/config")).unwrap(), b"git");
+            assert_eq!(fs::read(root.join("unrelated")).unwrap(), b"keep");
+            write_tree(&root, snapshot("new", b"new")).unwrap();
+            assert!(read_tree(&root).is_ok());
+        }
+    }
+
+    #[test]
+    fn failed_first_export_leaves_no_unowned_partial_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("book");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("unrelated"), b"keep").unwrap();
+        let result = write_tree_with_hook(&root, snapshot("new", b"new"), || {
+            Err(io::Error::other("injected publication failure"))
+        });
+        assert!(result.is_err());
+        assert!(!root.join("manifest.json").exists());
+        assert!(!root.join("ingredients.yaml").exists());
+        assert_eq!(fs::read(root.join("unrelated")).unwrap(), b"keep");
+        write_tree(&root, snapshot("new", b"new")).unwrap();
+        assert!(read_tree(&root).is_ok());
+    }
+
+    #[test]
+    fn failed_rollback_retains_old_bytes_and_recovery_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("book");
+        write_tree(&root, snapshot("old", b"old")).unwrap();
+        let result = write_tree_with_hook(&root, snapshot("new", b"new"), || {
+            let path = root.join("ingredients.yaml");
+            fs::remove_file(&path)?;
+            fs::create_dir(&path)?;
+            fs::write(path.join("block"), b"block")?;
+            Err(io::Error::other("injected failure"))
+        });
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("rollback incomplete"), "{error}");
+        let retained = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path != &root)
+            .unwrap();
+        assert_eq!(
+            fs::read(retained.join("before/ingredients.yaml")).unwrap(),
+            b"old"
+        );
+        assert!(retained.join("before/manifest.json").is_file());
+        assert!(retained.join("plan.json").is_file());
+        assert!(error.contains(retained.to_str().unwrap()));
+    }
 }

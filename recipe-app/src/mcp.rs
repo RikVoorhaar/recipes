@@ -220,6 +220,38 @@ fn result_text<T: Serialize>(result: Result<T, ApiError>) -> Result<String, Stri
     json_text(result.map_err(service_error)?)
 }
 
+fn add_public_links(service: &RecipeService, value: &mut Value) {
+    let (Some(base), Some(id)) = (
+        service.public_base_url.as_ref(),
+        value.get("id").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    if value.get("deleted").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+    let mut url = base.clone();
+    if let Ok(mut segments) = url.path_segments_mut() {
+        segments.pop_if_empty().push("recipes").push(id);
+    } else {
+        return;
+    }
+    let public_url = url.to_string();
+    url.path_segments_mut()
+        .expect("HTTP URL")
+        .pop()
+        .push(&format!("{id}.pdf"));
+    let object = value.as_object_mut().expect("recipe object");
+    object.insert("public_url".into(), public_url.into());
+    object.insert("pdf_url".into(), url.to_string().into());
+}
+
+fn linked_recipe(service: &RecipeService, recipe: impl Serialize) -> Result<Value, String> {
+    let mut value = serde_json::to_value(recipe).map_err(|_| "could not encode the tool result")?;
+    add_public_links(service, &mut value);
+    Ok(value)
+}
+
 fn search_query(value: Option<&Value>) -> Result<SearchQuery, String> {
     let Some(value) = value else {
         return Ok(SearchQuery::default());
@@ -284,13 +316,29 @@ async fn invoke(
             Ok(String::new())
         }
         Tool::PublishDraft => {
-            result_text(publish_draft(service, caller, id()?, arguments(args)?).await)
+            let saved = publish_draft(service, caller, id()?, arguments(args)?).await.map_err(service_error)?;
+            json_text(json!({"recipe": linked_recipe(service, saved.recipe)?, "warnings": saved.warnings}))
         }
         Tool::SearchRecipes => {
-            result_text(search_recipes(service, search_query(args.get("query"))?).await)
+            let mut found = search_recipes(service, search_query(args.get("query"))?).await.map_err(service_error)?;
+            if service.public_base_url.is_some() {
+                let public = list_recipes(service).await.map_err(service_error)?;
+                for item in &mut found {
+                    if public.iter().any(|recipe| recipe.id.as_deref() == item.get("id").and_then(Value::as_str)) {
+                        add_public_links(service, item);
+                    }
+                }
+            }
+            json_text(found)
         }
-        Tool::ListRecipes => result_text(list_recipes(service).await),
-        Tool::GetRecipe => result_text(get_recipe(service, id()?).await),
+        Tool::ListRecipes => {
+            let recipes = list_recipes(service).await.map_err(service_error)?;
+            json_text(recipes.into_iter().map(|recipe| linked_recipe(service, recipe)).collect::<Result<Vec<_>, _>>()?)
+        }
+        Tool::GetRecipe => {
+            let recipe = get_recipe(service, id()?).await.map_err(service_error)?;
+            json_text(linked_recipe(service, recipe)?)
+        }
         Tool::DeleteRecipe | Tool::RestoreRecipe | Tool::RestoreRevision => result_text(
             append_state_revision(
                 service,

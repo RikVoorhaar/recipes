@@ -11,6 +11,8 @@ pub struct Settings {
     pub api_tokens: Vec<String>,
     #[serde(default)]
     pub mcp_allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub public_base_url: Option<String>,
     #[serde(default = "default_cover_model")]
     pub cover_model: String,
     #[serde(default)]
@@ -91,8 +93,42 @@ impl Settings {
         {
             return Err(invalid_configuration().into());
         }
+        if settings
+            .public_base_url
+            .as_deref()
+            .is_some_and(|value| parse_public_base_url(value).is_none())
+        {
+            return Err(invalid_configuration().into());
+        }
         Ok(settings)
     }
+}
+
+pub fn parse_public_base_url(value: &str) -> Option<reqwest::Url> {
+    if value.trim() != value || value.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let (scheme, remainder) = value.split_once("://")?;
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        || remainder.split(['/', '?', '#']).next()?.contains('@')
+        || value.contains('\\')
+    {
+        return None;
+    }
+    let mut url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    Some(url)
 }
 
 fn invalid_configuration() -> io::Error {

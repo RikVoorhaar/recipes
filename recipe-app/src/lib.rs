@@ -37,6 +37,7 @@ pub(crate) struct RecipeService {
     images: Arc<dyn ImageStorage>,
     cover_generator: Option<Arc<Generator>>,
     mcp_allowed_origins: Arc<Vec<String>>,
+    public_base_url: Option<reqwest::Url>,
 }
 
 impl RecipeService {
@@ -51,6 +52,7 @@ impl RecipeService {
             images,
             cover_generator,
             mcp_allowed_origins: Arc::new(Vec::new()),
+            public_base_url: None,
         }
     }
 
@@ -100,7 +102,23 @@ pub fn app_with_mcp_origins(
     cover_generator: Option<Arc<Generator>>,
     allowed_origins: Vec<String>,
 ) -> Router {
-    app_router(pool, images, cover_generator, allowed_origins)
+    app_with_public_base_url(pool, images, cover_generator, allowed_origins, None)
+}
+
+pub fn app_with_public_base_url(
+    pool: SqlitePool,
+    images: Arc<dyn ImageStorage>,
+    cover_generator: Option<Arc<Generator>>,
+    allowed_origins: Vec<String>,
+    public_base_url: Option<reqwest::Url>,
+) -> Router {
+    app_router(
+        pool,
+        images,
+        cover_generator,
+        allowed_origins,
+        public_base_url,
+    )
 }
 
 pub async fn configure_tokens(pool: &SqlitePool, tokens: &[String]) -> Result<(), sqlx::Error> {
@@ -125,9 +143,11 @@ fn app_router(
     images: Arc<dyn ImageStorage>,
     cover_generator: Option<Arc<Generator>>,
     allowed_origins: Vec<String>,
+    public_base_url: Option<reqwest::Url>,
 ) -> Router {
     let mut state = RecipeService::new(pool, images, cover_generator);
     state.mcp_allowed_origins = Arc::new(allowed_origins);
+    state.public_base_url = public_base_url;
     let mcp_router = Router::new()
         .route(
             "/mcp",

@@ -46,6 +46,130 @@ async fn server() -> (tempfile::TempDir, String) {
     (dir, url)
 }
 
+#[tokio::test]
+async fn modern_batch_cannot_dispatch_through_legacy_version() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    let batch = json!([
+        {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"save_draft","arguments":{"document":{"title":"Must not exist"}},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+        }}
+    ]);
+    for mirrored_method in [false, true] {
+        let mut request = client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&batch);
+        if mirrored_method {
+            request = request.header("mcp-method", "tools/list");
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            -32600
+        );
+    }
+    assert_eq!(
+        tool_json(
+            &tool(
+                &client,
+                &url,
+                "authorization",
+                "Bearer first",
+                "list_drafts",
+                json!({})
+            )
+            .await
+        ),
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn malformed_modern_version_headers_return_header_mismatch() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    let body = json!({"jsonrpc":"2.0","id":"version-check","method":"tools/list","params":{"_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}
+    }}});
+    let requests = [
+        client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-method", "tools/list")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-protocol-version", "2026-07-28"),
+        client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-method", "tools/list")
+            .header("mcp-protocol-version", "2026-07-28, 2026-07-28"),
+        client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-method", "tools/list")
+            .header(
+                "mcp-protocol-version",
+                reqwest::header::HeaderValue::from_bytes(b"\x80").unwrap(),
+            ),
+    ];
+    for request in requests {
+        let response = request.json(&body).send().await.unwrap();
+        assert_eq!(response.status(), 400);
+        let error: Value = response.json().await.unwrap();
+        assert_eq!(error["id"], "version-check");
+        assert_eq!(error["error"]["code"], -32020);
+    }
+}
+
+#[tokio::test]
+async fn unknown_tool_is_protocol_error_only_for_modern_clients() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    let body = json!({"jsonrpc":"2.0","id":42,"method":"tools/call","params":{
+        "name":"not_a_tool","arguments":{},
+        "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+    }});
+    let response = client
+        .post(&url)
+        .bearer_auth("first")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "not_a_tool")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["id"], 42);
+    assert_eq!(error["error"]["code"], -32602);
+    let legacy = tool(
+        &client,
+        &url,
+        "authorization",
+        "Bearer first",
+        "not_a_tool",
+        json!({}),
+    )
+    .await;
+    assert_eq!(legacy["isError"], true);
+    let known_failure = client.post(&url).bearer_auth("first")
+        .header("mcp-protocol-version","2026-07-28")
+        .header("mcp-method","tools/call").header("mcp-name","get_draft")
+        .json(&json!({"jsonrpc":"2.0","id":43,"method":"tools/call","params":{
+            "name":"get_draft","arguments":{"id":"missing"},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+        }})).send().await.unwrap();
+    assert_eq!(
+        known_failure.json::<Value>().await.unwrap()["result"]["isError"],
+        true
+    );
+}
+
 async fn rpc(
     client: &reqwest::Client,
     url: &str,

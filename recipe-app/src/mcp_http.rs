@@ -154,6 +154,18 @@ fn valid_request(message: &Value) -> bool {
             .is_none_or(|p| p.is_object() || p.is_array())
 }
 
+fn modern_message(message: &Value) -> bool {
+    match message {
+        Value::Array(messages) => messages.iter().any(modern_message),
+        _ => {
+            message["method"] == "server/discover"
+                || message
+                    .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+                    .is_some()
+        }
+    }
+}
+
 pub(crate) async fn check_origin(
     State(origins): State<Arc<Vec<String>>>,
     request: Request,
@@ -208,12 +220,7 @@ pub(crate) async fn post(
         }
         Err(error) => return error.into_response(),
     };
-    let version = match one_header(&headers, "mcp-protocol-version") {
-        // No session state is kept, so the backwards-compatibility default applies.
-        Ok(None) => "2025-03-26",
-        Ok(Some(version)) => version,
-        _ => return StatusCode::BAD_REQUEST.into_response(),
-    };
+    let version_header = one_header(&headers, "mcp-protocol-version");
     if !matches!(one_header(&headers, "content-type"), Ok(Some(value)) if value.split(';').next().is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json")))
     {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
@@ -228,17 +235,30 @@ pub(crate) async fn post(
                 .into_response()
         }
     };
-    let modern = version == mcp::MODERN_PROTOCOL
-        || message["method"] == "server/discover"
-        || message
-            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
-            .is_some()
+    let modern = headers
+        .get_all("mcp-protocol-version")
+        .iter()
+        .any(|value| value.as_bytes() == mcp::MODERN_PROTOCOL.as_bytes())
+        || modern_message(&message)
         || headers.contains_key("mcp-method");
+    let version = match version_header {
+        // No session state is kept, so the backwards-compatibility default applies.
+        Ok(None) => "2025-03-26",
+        Ok(Some(version)) => version,
+        Err(()) if modern => {
+            return modern_error(
+                &message,
+                -32020,
+                "Missing, malformed, or inconsistent MCP header",
+            );
+        }
+        Err(()) => return StatusCode::BAD_REQUEST.into_response(),
+    };
     if !modern && !mcp::SUPPORTED_PROTOCOLS.contains(&version) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     if let Value::Array(messages) = message {
-        if !matches!(version, "2025-03-26" | "2024-11-05") || messages.is_empty() {
+        if modern || !matches!(version, "2025-03-26" | "2024-11-05") || messages.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(rpc_error(-32600, "Invalid Request")),
@@ -275,6 +295,16 @@ pub(crate) async fn post(
         }
         if let Err(response) = modern_validation(&headers, &message) {
             return *response;
+        }
+        if message.get("id").is_some()
+            && message["method"] == "tools/call"
+            && !mcp::known_tool(message["params"]["name"].as_str().unwrap_or(""))
+        {
+            return Json(json!({
+                "jsonrpc":"2.0", "id":message["id"],
+                "error":{"code":-32602,"message":"Unknown tool"}
+            }))
+            .into_response();
         }
     }
     match mcp::handle(&state, &caller, message).await {

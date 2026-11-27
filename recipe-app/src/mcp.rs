@@ -540,6 +540,10 @@ fn text_content(text: String) -> Value {
 const GUIDELINES_URI: &str = "recipe://guidelines";
 const INSTRUCTIONS: &str = include_str!("../guidelines/mcp-instructions.txt");
 
+pub(crate) fn known_tool(name: &str) -> bool {
+    Tool::parse(name).is_some()
+}
+
 /// Dispatch a decoded message after the transport has authenticated the caller.
 /// Notifications have no response.
 pub(crate) async fn handle(

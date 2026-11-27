@@ -1,3 +1,5 @@
+pub mod book_archive;
+pub mod book_snapshot;
 pub mod config;
 pub mod cover;
 pub mod database;

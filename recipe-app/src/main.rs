@@ -1,6 +1,6 @@
 use recipe_app::{
-    app_with_public_base_url, config::Settings, cover::Generator, database,
-    storage::FileImageStorage,
+    app_with_public_base_url, book_archive, book_snapshot, config::Settings, cover::Generator,
+    database, storage::FileImageStorage,
 };
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -20,6 +20,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let settings = Settings::load()?;
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("import") {
+        if args.len() != 4 || args[2] != "--src" {
+            return Err("usage: recipe-app import --src PATH".into());
+        }
+        book_archive::import_tree(
+            std::path::Path::new(&args[3]),
+            &settings.database_path,
+            &settings.content_dir,
+        )
+        .await?;
+        println!("Book imported.");
+        return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("export") {
+        if args.len() != 4 || args[2] != "--dest" {
+            return Err("usage: recipe-app export --dest PATH".into());
+        }
+        let dest = std::path::Path::new(&args[3]);
+        book_archive::safe_path(dest)?;
+        book_archive::safe_path(&settings.database_path)?;
+        book_archive::safe_path(&settings.content_dir)?;
+        let absolute = if dest.exists() {
+            dest.canonicalize()?
+        } else {
+            let parent = dest
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            parent
+                .canonicalize()?
+                .join(dest.file_name().ok_or("invalid destination")?)
+        };
+        let database = settings.database_path.canonicalize()?;
+        let content = settings.content_dir.canonicalize()?;
+        if database.starts_with(&absolute)
+            || content.starts_with(&absolute)
+            || absolute.starts_with(&content)
+        {
+            return Err("export destination overlaps application data".into());
+        }
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database)
+            .read_only(true)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = sqlx::SqlitePool::connect_with(options).await?;
+        let snapshot = book_snapshot::capture(&pool, &book_archive::ExportImages(content)).await?;
+        book_archive::write_tree(dest, snapshot)?;
+        println!("Book exported.");
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         let mut address: SocketAddr = settings.bind_addr.parse()?;
         if address.ip().is_unspecified() {

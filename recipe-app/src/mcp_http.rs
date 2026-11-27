@@ -10,7 +10,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::{authorize_secret, mcp, RecipeService};
+use crate::{authorize_secret, caller_is_active, mcp, RecipeService};
 
 pub(crate) fn valid_origin(origin: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(origin) else {
@@ -53,6 +53,14 @@ fn credential(headers: &HeaderMap) -> Result<&str, ()> {
 
 fn rpc_error(code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":null,"error":{"code":code,"message":message}})
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+    )
+        .into_response()
 }
 
 fn valid_request(message: &Value) -> bool {
@@ -112,13 +120,7 @@ pub(crate) async fn post(
     };
     let caller = match caller {
         Ok(caller) => caller,
-        Err(error) if error.code == "unauthorized" => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Bearer")],
-            )
-                .into_response()
-        }
+        Err(error) if error.code == "unauthorized" => return unauthorized(),
         Err(error) => return error.into_response(),
     };
     let version = match one_header(&headers, "mcp-protocol-version") {
@@ -153,8 +155,15 @@ pub(crate) async fn post(
         for message in messages {
             if !valid_request(&message) {
                 responses.push(rpc_error(-32600, "Invalid Request"));
-            } else if let Some(response) = mcp::handle(&state, &caller, message).await {
-                responses.push(response);
+            } else {
+                match caller_is_active(&state, &caller).await {
+                    Ok(true) => {}
+                    Ok(false) => return unauthorized(),
+                    Err(error) => return error.into_response(),
+                }
+                if let Some(response) = mcp::handle(&state, &caller, message).await {
+                    responses.push(response);
+                }
             }
         }
         return if responses.is_empty() {
@@ -169,6 +178,11 @@ pub(crate) async fn post(
             Json(rpc_error(-32600, "Invalid Request")),
         )
             .into_response();
+    }
+    match caller_is_active(&state, &caller).await {
+        Ok(true) => {}
+        Ok(false) => return unauthorized(),
+        Err(error) => return error.into_response(),
     }
     match mcp::handle(&state, &caller, message).await {
         Some(response) => Json(response).into_response(),

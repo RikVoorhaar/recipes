@@ -28,14 +28,27 @@ impl RunningApp {
         std::fs::write(
             &config,
             format!(
-                "bind_addr = {:?}\ndatabase_path = {:?}\ncontent_dir = {:?}\napi_tokens = [\"ops:{}\"]\n",
+                "bind_addr = {:?}\ndatabase_path = {:?}\ncontent_dir = {:?}\n",
                 address.to_string(),
                 directory.join("recipes.sqlite3").display().to_string(),
                 directory.join("content").display().to_string(),
-                TOKEN,
             ),
         )
         .unwrap();
+        let pool = recipe_app::database::connect(&directory.join("recipes.sqlite3"))
+            .await
+            .unwrap();
+        recipe_app::database::migrate(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if count == 0 {
+            recipe_app::configure_tokens(&pool, &[format!("ops:{TOKEN}")])
+                .await
+                .unwrap();
+        }
+        pool.close().await;
         let child = Command::new(env!("CARGO_BIN_EXE_recipe-app"))
             .env("APP_CONFIG_FILE", config)
             .env_remove("APP__BIND_ADDR")

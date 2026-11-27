@@ -30,6 +30,7 @@ async fn healthcheck_probes_server_without_creating_data() {
     assert!(!probe().status.success());
     assert!(!database.exists());
     assert!(!content.exists());
+    seed_token(&database).await;
     let child = start_binary(
         &directory.path().join("missing.toml"),
         &database,
@@ -68,13 +69,13 @@ fn invalid_public_base_url_fails_before_startup() {
 async fn configured_public_base_url_is_used_by_binary() {
     let directory = TempDir::new().unwrap();
     let address = available_address();
+    seed_token(&directory.path().join("db.sqlite")).await;
     let child = Command::new(env!("CARGO_BIN_EXE_recipe-app"))
         .env_clear()
         .env("APP_CONFIG_FILE", directory.path().join("missing.toml"))
         .env("APP__BIND_ADDR", address.to_string())
         .env("APP__DATABASE_PATH", directory.path().join("db.sqlite"))
         .env("APP__CONTENT_DIR", directory.path().join("content"))
-        .env("APP__API_TOKENS", "owner:secret")
         .env("APP__PUBLIC_BASE_URL", "https://recipes.example/prefix")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -128,6 +129,7 @@ async fn mcp_tool(
 async fn absent_origin_configuration_denies_origins_but_not_non_browser_requests() {
     let directory = TempDir::new().unwrap();
     let address = available_address();
+    seed_token(&directory.path().join("db.sqlite")).await;
     let child = start_binary(
         &directory.path().join("missing.toml"),
         &directory.path().join("db.sqlite"),
@@ -169,13 +171,13 @@ async fn absent_origin_configuration_denies_origins_but_not_non_browser_requests
 async fn configured_browser_origins_are_enforced_by_the_binary() {
     let directory = TempDir::new().unwrap();
     let address = available_address();
+    seed_token(&directory.path().join("db.sqlite")).await;
     let child = Command::new(env!("CARGO_BIN_EXE_recipe-app"))
         .env_clear()
         .env("APP_CONFIG_FILE", directory.path().join("missing.toml"))
         .env("APP__BIND_ADDR", address.to_string())
         .env("APP__DATABASE_PATH", directory.path().join("db.sqlite"))
         .env("APP__CONTENT_DIR", directory.path().join("content"))
-        .env("APP__API_TOKENS", "owner:secret")
         .env(
             "APP__MCP_ALLOWED_ORIGINS",
             "http://localhost:6274,https://trusted.example",
@@ -299,7 +301,7 @@ fn start_binary(
     database_path: &Path,
     content_dir: &Path,
     address: SocketAddr,
-    tokens: &str,
+    _tokens: &str,
 ) -> Child {
     Command::new(env!("CARGO_BIN_EXE_recipe-app"))
         .env_clear()
@@ -307,7 +309,6 @@ fn start_binary(
         .env("APP__BIND_ADDR", address.to_string())
         .env("APP__DATABASE_PATH", database_path)
         .env("APP__CONTENT_DIR", content_dir)
-        .env("APP__API_TOKENS", tokens)
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -358,12 +359,16 @@ fn assert_logged_health_request(logs: &str) {
         "startup log missing: {logs}"
     );
     assert!(
-        logs.contains("\"configured_token_count\":2"),
-        "both comma-separated environment tokens were not loaded: {logs}"
-    );
-    assert!(
         logs.contains("request received"),
         "request log missing: {logs}"
     );
     assert!(logs.contains("/health"), "health path log missing: {logs}");
+}
+
+async fn seed_token(path: &Path) {
+    let pool = recipe_app::database::connect(path).await.unwrap();
+    recipe_app::database::migrate(&pool).await.unwrap();
+    recipe_app::configure_tokens(&pool, &["owner:secret".into()])
+        .await
+        .unwrap();
 }

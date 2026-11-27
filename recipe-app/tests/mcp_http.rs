@@ -96,6 +96,113 @@ fn tool_json(result: &Value) -> Value {
 }
 
 #[tokio::test]
+async fn activity_under_write_lock_does_not_starve_requests_or_token_management() {
+    let (dir, url) = server().await;
+    let pool = database::connect(&dir.path().join("db.sqlite"))
+        .await
+        .unwrap();
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query("UPDATE api_tokens SET label=label WHERE label='owner'")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let requests = (0..100).map(|_| {
+        client
+            .post(&url)
+            .bearer_auth("first")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+            .send()
+    });
+    let responses = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        futures_util::future::join_all(requests),
+    )
+    .await
+    .expect("reads must not wait for activity writes");
+    assert!(responses.into_iter().all(|r| r.unwrap().status() == 200));
+    writer.commit().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        recipe_app::token::revoke(&pool, "owner"),
+    )
+    .await
+    .expect("revoke should not be starved")
+    .unwrap();
+    let response = client
+        .post(&url)
+        .bearer_auth("first")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
+
+#[tokio::test]
+async fn host_cli_changes_are_visible_to_running_mcp_and_rotation_keeps_drafts() {
+    let (dir, url) = server().await;
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_recipe-app"))
+            .env("APP__DATABASE_PATH", dir.path().join("db.sqlite"))
+            .env("APP__CONTENT_DIR", dir.path().join("images"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let first = run(&["token", "create", "--label", "cli-owner"]);
+    let client = reqwest::Client::new();
+    let saved = tool_json(
+        &tool(
+            &client,
+            &url,
+            "authorization",
+            &format!("Bearer {first}"),
+            "save_draft",
+            json!({"document":{"title":"Private"}}),
+        )
+        .await,
+    );
+    let second = run(&["token", "rotate", "--label", "cli-owner"]);
+    let request = |secret: &str| {
+        client
+            .post(&url)
+            .bearer_auth(secret)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+    };
+    assert_eq!(request(&first).send().await.unwrap().status(), 401);
+    let draft = tool_json(
+        &tool(
+            &client,
+            &url,
+            "authorization",
+            &format!("Bearer {second}"),
+            "get_draft",
+            json!({"id":saved["id"]}),
+        )
+        .await,
+    );
+    assert_eq!(draft["id"], saved["id"]);
+    run(&["token", "revoke", "--label", "cli-owner"]);
+    assert_eq!(request(&second).send().await.unwrap().status(), 401);
+    let pool = database::connect(&dir.path().join("db.sqlite"))
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM recipe_drafts WHERE id=?")
+        .bind(saved["id"].as_str().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn batching_depends_on_protocol_version_and_preserves_identity() {
     let (_dir, url) = server().await;
     let client = reqwest::Client::new();

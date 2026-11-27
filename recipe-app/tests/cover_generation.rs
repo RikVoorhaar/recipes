@@ -579,6 +579,60 @@ async fn failed_publish_does_not_promote_private_candidate() {
 }
 
 #[tokio::test]
+async fn revocation_between_batch_operations_blocks_next_dispatch_but_not_running_tool() {
+    let (endpoint, _, _, gate) = fake_provider().await;
+    let app = support::TestApp::start_with_generator(generator(&endpoint)).await;
+    let client = reqwest::Client::new();
+    let url = app.url("");
+    let draft = mcp::tool(
+        &client,
+        &url,
+        "test-secret",
+        "save_draft",
+        json!({"document":{"title":"Soup"}}),
+    )
+    .await;
+    let id = draft["id"].as_str().unwrap().to_owned();
+    gate.block.store(true, Ordering::SeqCst);
+    let task_url = url.clone();
+    let task_id = id.clone();
+    let request = tokio::spawn(async move {
+        reqwest::Client::new().post(format!("{task_url}/mcp")).bearer_auth("test-secret")
+            .json(&json!([
+                {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"generate_cover","arguments":{"draft_id":task_id,"expected_revision":1,"dish_description":"Tomato soup."}}},
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"save_draft","arguments":{"id":task_id,"expected_revision":1,"document":{"title":"Should not save"}}}}
+            ])).send().await.unwrap()
+    });
+    gate.entered.notified().await;
+    recipe_app::token::revoke(app.pool(), "integration")
+        .await
+        .unwrap();
+    let new_request = client
+        .post(format!("{url}/mcp"))
+        .bearer_auth("test-secret")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(new_request.status(), 401);
+    gate.release.add_permits(1);
+    assert_eq!(request.await.unwrap().status(), 401);
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM recipe_drafts WHERE id=?")
+        .bind(&id)
+        .fetch_one(app.pool())
+        .await
+        .unwrap();
+    let candidates: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM draft_cover_candidates WHERE draft_id=?")
+            .bind(&id)
+            .fetch_one(app.pool())
+            .await
+            .unwrap();
+    assert_eq!(revision, 1);
+    assert_eq!(candidates, 1);
+}
+
+#[tokio::test]
 async fn in_flight_draft_generation_rechecks_revision_after_provider_returns() {
     let (endpoint, calls, _, gate) = fake_provider().await;
     let app = support::TestApp::start_with_generator(generator(&endpoint)).await;

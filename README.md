@@ -3,9 +3,21 @@
 ## OpenCode quickstart
 
 The MCP endpoint uses Streamable HTTP; the stdio adapter has been removed.
-It supports the initialize-based protocol revisions through `2025-11-25`, not
-the current `2026-07-28` per-request-metadata protocol. Clients that support
-both eras must use their legacy mode or fallback.
+It supports `2026-07-28` per-request metadata and the legacy initialize-based
+revisions through `2025-11-25`. Select `2026-07-28` in clients that support it;
+older clients can continue to use initialize-based negotiation. The OpenCode
+configuration below does not itself select a revision: check the client's
+negotiated version rather than assuming it uses the current one. Live connector
+compatibility remains to be verified in issue #16.
+
+Modern clients send `MCP-Protocol-Version: 2026-07-28` and `Mcp-Method` on
+every request, and `Mcp-Name` on tool calls and resource reads. Each request's
+`params._meta` contains `io.modelcontextprotocol/protocolVersion` with the same
+version and `io.modelcontextprotocol/clientCapabilities` (an empty object is
+valid). `server/discover` reports supported revisions and capabilities;
+`tools/list` and `tools/call` can also be sent without a prior handshake.
+All requests still require authentication. Server tool input schemas use the
+default JSON Schema 2020-12 dialect.
 
 Merge this into `~/.config/opencode/opencode.json`:
 

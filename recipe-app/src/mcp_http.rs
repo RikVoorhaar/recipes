@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -55,6 +56,92 @@ fn rpc_error(code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":null,"error":{"code":code,"message":message}})
 }
 
+fn modern_error(message: &Value, code: i32, text: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "jsonrpc":"2.0", "id":message.get("id").cloned().unwrap_or(Value::Null),
+            "error":{"code":code,"message":text}
+        })),
+    )
+        .into_response()
+}
+
+fn decoded_name(value: &str) -> Option<String> {
+    if let Some(encoded) = value
+        .strip_prefix("=?base64?")
+        .and_then(|v| v.strip_suffix("?="))
+    {
+        String::from_utf8(STANDARD.decode(encoded).ok()?).ok()
+    } else if value.trim() == value
+        && value
+            .bytes()
+            .all(|b| b == b' ' || b == b'\t' || (0x21..=0x7e).contains(&b))
+    {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
+fn modern_validation(headers: &HeaderMap, message: &Value) -> Result<(), Box<Response>> {
+    let mismatch = || {
+        Box::new(modern_error(
+            message,
+            -32020,
+            "Missing, malformed, or inconsistent MCP header",
+        ))
+    };
+    let version = one_header(headers, "mcp-protocol-version")
+        .map_err(|_| mismatch())?
+        .ok_or_else(mismatch)?;
+    let method = one_header(headers, "mcp-method")
+        .map_err(|_| mismatch())?
+        .ok_or_else(mismatch)?;
+    if message["method"].as_str() != Some(method) {
+        return Err(mismatch());
+    }
+    let meta = &message["params"]["_meta"];
+    let body_version = meta
+        .get("io.modelcontextprotocol/protocolVersion")
+        .and_then(Value::as_str);
+    if body_version.is_some_and(|v| v != version) {
+        return Err(mismatch());
+    }
+    if matches!(method, "tools/call" | "resources/read" | "prompts/get") {
+        let name = one_header(headers, "mcp-name")
+            .map_err(|_| mismatch())?
+            .and_then(decoded_name)
+            .ok_or_else(mismatch)?;
+        let field = if method == "resources/read" {
+            "uri"
+        } else {
+            "name"
+        };
+        if message["params"][field].as_str() != Some(&name) {
+            return Err(mismatch());
+        }
+    }
+    if body_version.is_none()
+        || !meta
+            .get("io.modelcontextprotocol/clientCapabilities")
+            .is_some_and(Value::is_object)
+    {
+        return Err(Box::new(modern_error(
+            message,
+            -32602,
+            "Missing or invalid protocol metadata",
+        )));
+    }
+    if version != mcp::MODERN_PROTOCOL {
+        return Err(Box::new((StatusCode::BAD_REQUEST, Json(json!({
+            "jsonrpc":"2.0","id":message.get("id").cloned().unwrap_or(Value::Null),
+            "error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":mcp::ALL_PROTOCOLS,"requested":version}}
+        }))).into_response()));
+    }
+    Ok(())
+}
+
 fn valid_request(message: &Value) -> bool {
     message.is_object()
         && message["jsonrpc"] == "2.0"
@@ -93,7 +180,7 @@ pub(crate) async fn check_origin(
         );
         headers.insert(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            "authorization, content-type, x-api-key, mcp-protocol-version"
+            "authorization, content-type, x-api-key, mcp-protocol-version, mcp-method, mcp-name"
                 .parse()
                 .unwrap(),
         );
@@ -124,7 +211,7 @@ pub(crate) async fn post(
     let version = match one_header(&headers, "mcp-protocol-version") {
         // No session state is kept, so the backwards-compatibility default applies.
         Ok(None) => "2025-03-26",
-        Ok(Some(version)) if mcp::SUPPORTED_PROTOCOLS.contains(&version) => version,
+        Ok(Some(version)) => version,
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
     if !matches!(one_header(&headers, "content-type"), Ok(Some(value)) if value.split(';').next().is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json")))
@@ -141,6 +228,15 @@ pub(crate) async fn post(
                 .into_response()
         }
     };
+    let modern = version == mcp::MODERN_PROTOCOL
+        || message["method"] == "server/discover"
+        || message
+            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            .is_some()
+        || headers.contains_key("mcp-method");
+    if !modern && !mcp::SUPPORTED_PROTOCOLS.contains(&version) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     if let Value::Array(messages) = message {
         if !matches!(version, "2025-03-26" | "2024-11-05") || messages.is_empty() {
             return (
@@ -170,8 +266,30 @@ pub(crate) async fn post(
         )
             .into_response();
     }
+    if modern {
+        if message
+            .get("id")
+            .is_some_and(|id| !(id.is_string() || id.is_i64() || id.is_u64()))
+        {
+            return modern_error(&message, -32600, "Invalid Request");
+        }
+        if let Err(response) = modern_validation(&headers, &message) {
+            return *response;
+        }
+    }
     match mcp::handle(&state, &caller, message).await {
-        Some(response) => Json(response).into_response(),
+        Some(mut response) => {
+            if modern {
+                if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
+                    result.insert("resultType".into(), json!("complete"));
+                    result.insert("_meta".into(), json!({"io.modelcontextprotocol/serverInfo":{"name":"recipe-mcp","version":"0.1.0"}}));
+                }
+                if response["error"]["code"] == -32601 {
+                    return (StatusCode::NOT_FOUND, Json(response)).into_response();
+                }
+            }
+            Json(response).into_response()
+        }
         None => StatusCode::ACCEPTED.into_response(),
     }
 }

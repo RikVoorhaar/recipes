@@ -558,6 +558,11 @@ pub(crate) async fn handle(
             "instructions":INSTRUCTIONS,
             "serverInfo":{"name":"recipe-mcp","version":"0.1.0"}
         }),
+        Some("server/discover") => json!({
+            "supportedVersions": ALL_PROTOCOLS,
+            "capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false}},
+            "instructions":INSTRUCTIONS
+        }),
         Some("ping") => json!({}),
         Some("tools/list") => json!({"tools":tools()}),
         Some("resources/list") => {
@@ -587,6 +592,14 @@ pub(crate) async fn handle(
 
 pub(crate) const SUPPORTED_PROTOCOLS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+pub(crate) const MODERN_PROTOCOL: &str = "2026-07-28";
+pub(crate) const ALL_PROTOCOLS: &[&str] = &[
+    MODERN_PROTOCOL,
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
 
 fn negotiate_protocol(requested: Option<&Value>) -> &'static str {
     requested

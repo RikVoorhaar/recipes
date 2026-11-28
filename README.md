@@ -3,9 +3,40 @@
 ## OpenCode quickstart
 
 The MCP endpoint uses Streamable HTTP; the stdio adapter has been removed.
-It supports the initialize-based protocol revisions through `2025-11-25`, not
-the current `2026-07-28` per-request-metadata protocol. Clients that support
-both eras must use their legacy mode or fallback.
+It supports `2026-07-28` per-request metadata and the legacy initialize-based
+revisions through `2025-11-25`. Select `2026-07-28` in clients that support it;
+older clients can continue to use initialize-based negotiation. The OpenCode
+configuration below does not itself select a revision: check the client's
+negotiated version rather than assuming it uses the current one. Live connector
+compatibility remains to be verified in issue #16.
+
+Modern clients send `MCP-Protocol-Version: 2026-07-28` and `Mcp-Method` on
+every request, and `Mcp-Name` on tool calls and resource reads. Each request's
+`params._meta` contains `io.modelcontextprotocol/protocolVersion` with the same
+version and `io.modelcontextprotocol/clientCapabilities` (an empty object is
+valid). `server/discover` reports supported revisions and capabilities;
+`tools/list` and `tools/call` can also be sent without a prior handshake.
+All requests still require authentication. Modern cacheable results include
+`ttlMs: 0` (immediately stale) and `cacheScope: "private"` (reuse only within
+the same authorization context); these hints do not replace access controls.
+See the [2026 caching specification](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching).
+Server tool input schemas use the default JSON Schema 2020-12 dialect.
+
+Local interoperability check: `scripts/mcp_2026_probe.py`
+(`python-stdlib-mcp-probe` 1.0, Python 3.12.3) explicitly used `2026-07-28`
+for discovery, tool listing, and a tool call against a loopback-only server.
+This hand-written probe is supplemental, not an independent MCP SDK or a live
+connector.
+
+Independent client check (2026-11-27): the released
+[official Python SDK `mcp==2.3.0`](https://pypi.org/project/mcp/2.3.0/),
+with `mcp-types==2.3.0` and Python 3.13.12, was run against a local loopback
+server with `mode="2026-07-28"`. The initial check failed SDK validation because
+`cacheScope` and `ttlMs` were absent. After adding the required hints,
+`scripts/mcp_sdk_2026_probe.py` passed actual discovery, tool listing and
+`get_guidelines` call, and resource listing and reading. The probe explicitly
+sends discovery because the SDK's explicit-version mode otherwise synthesizes
+its discovery result. No live connector was exercised.
 
 Merge this into `~/.config/opencode/opencode.json`:
 

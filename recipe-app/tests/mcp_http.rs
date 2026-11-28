@@ -46,6 +46,285 @@ async fn server() -> (tempfile::TempDir, String) {
     (dir, url)
 }
 
+#[tokio::test]
+async fn modern_tool_call_arguments_must_be_objects_when_present() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    for name in ["get_guidelines", "save_draft"] {
+        for arguments in [
+            json!([]),
+            json!("invalid"),
+            json!(null),
+            json!(42),
+            json!(true),
+        ] {
+            let body = json!({"jsonrpc":"2.0","id":"call","method":"tools/call","params":{
+                "name":name, "arguments":arguments,
+                "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+            }});
+            let response = client
+                .post(&url)
+                .bearer_auth("first")
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "tools/call")
+                .header("mcp-name", name)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["id"], "call");
+            assert_eq!(body["error"]["code"], -32602);
+            assert!(body.get("result").is_none());
+        }
+    }
+    assert_eq!(
+        tool_json(
+            &tool(
+                &client,
+                &url,
+                "authorization",
+                "Bearer first",
+                "list_drafts",
+                json!({})
+            )
+            .await
+        ),
+        json!([])
+    );
+    for arguments in [None, Some(json!({}))] {
+        let mut params = json!({"name":"get_guidelines","_meta":{
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}
+        }});
+        if let Some(arguments) = arguments {
+            params["arguments"] = arguments;
+        }
+        let response: Value = client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "get_guidelines")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":params}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["resultType"], "complete");
+        assert_ne!(response["result"]["isError"], true);
+    }
+    let legacy = tool(
+        &client,
+        &url,
+        "authorization",
+        "Bearer first",
+        "get_guidelines",
+        json!([]),
+    )
+    .await;
+    assert_ne!(legacy["isError"], true);
+    assert!(legacy["content"].is_array());
+}
+
+#[tokio::test]
+async fn cache_hints_are_modern_only_and_only_on_cacheable_successes() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    for (method, name) in [
+        ("server/discover", None),
+        ("tools/list", None),
+        ("resources/list", None),
+        ("resources/read", Some("recipe://guidelines")),
+        ("tools/call", Some("get_guidelines")),
+        ("resources/read", Some("recipe://missing")),
+    ] {
+        let mut params = json!({"_meta":{
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities":{}
+        }});
+        if let Some(name) = name {
+            params[if method == "resources/read" {
+                "uri"
+            } else {
+                "name"
+            }] = json!(name);
+        }
+        let mut request = client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", method);
+        if let Some(name) = name {
+            request = request.header("mcp-name", name);
+        }
+        let response: Value = request
+            .json(&json!({
+                "jsonrpc":"2.0","id":1,"method":method,"params":params
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if method == "resources/read" && name == Some("recipe://missing") {
+            assert_eq!(response["error"]["code"], -32602);
+            assert!(response.get("result").is_none());
+        } else if method == "tools/call" {
+            assert!(response["result"].get("ttlMs").is_none());
+            assert!(response["result"].get("cacheScope").is_none());
+        } else {
+            assert_eq!(response["result"]["ttlMs"], 0);
+            assert_eq!(response["result"]["cacheScope"], "private");
+            assert!(response["result"]["_meta"].get("ttlMs").is_none());
+        }
+    }
+    for (method, params) in [
+        ("tools/list", json!({})),
+        ("resources/list", json!({})),
+        ("resources/read", json!({"uri":"recipe://guidelines"})),
+    ] {
+        let response = rpc(
+            &client,
+            &url,
+            "authorization",
+            "Bearer first",
+            method,
+            params,
+        )
+        .await;
+        assert!(response["result"].get("ttlMs").is_none());
+        assert!(response["result"].get("cacheScope").is_none());
+    }
+}
+
+#[tokio::test]
+async fn modern_batch_cannot_dispatch_through_legacy_version() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    let batch = json!([
+        {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"save_draft","arguments":{"document":{"title":"Must not exist"}},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+        }}
+    ]);
+    for mirrored_method in [false, true] {
+        let mut request = client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&batch);
+        if mirrored_method {
+            request = request.header("mcp-method", "tools/list");
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            -32600
+        );
+    }
+    assert_eq!(
+        tool_json(
+            &tool(
+                &client,
+                &url,
+                "authorization",
+                "Bearer first",
+                "list_drafts",
+                json!({})
+            )
+            .await
+        ),
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn malformed_modern_version_headers_return_header_mismatch() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    let body = json!({"jsonrpc":"2.0","id":"version-check","method":"tools/list","params":{"_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}
+    }}});
+    let requests = [
+        client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-method", "tools/list")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-protocol-version", "2026-07-28"),
+        client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-method", "tools/list")
+            .header("mcp-protocol-version", "2026-07-28, 2026-07-28"),
+        client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-method", "tools/list")
+            .header(
+                "mcp-protocol-version",
+                reqwest::header::HeaderValue::from_bytes(b"\x80").unwrap(),
+            ),
+    ];
+    for request in requests {
+        let response = request.json(&body).send().await.unwrap();
+        assert_eq!(response.status(), 400);
+        let error: Value = response.json().await.unwrap();
+        assert_eq!(error["id"], "version-check");
+        assert_eq!(error["error"]["code"], -32020);
+    }
+}
+
+#[tokio::test]
+async fn unknown_tool_is_protocol_error_only_for_modern_clients() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    let body = json!({"jsonrpc":"2.0","id":42,"method":"tools/call","params":{
+        "name":"not_a_tool","arguments":{},
+        "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+    }});
+    let response = client
+        .post(&url)
+        .bearer_auth("first")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "not_a_tool")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["id"], 42);
+    assert_eq!(error["error"]["code"], -32602);
+    let legacy = tool(
+        &client,
+        &url,
+        "authorization",
+        "Bearer first",
+        "not_a_tool",
+        json!({}),
+    )
+    .await;
+    assert_eq!(legacy["isError"], true);
+    let known_failure = client.post(&url).bearer_auth("first")
+        .header("mcp-protocol-version","2026-07-28")
+        .header("mcp-method","tools/call").header("mcp-name","get_draft")
+        .json(&json!({"jsonrpc":"2.0","id":43,"method":"tools/call","params":{
+            "name":"get_draft","arguments":{"id":"missing"},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+        }})).send().await.unwrap();
+    assert_eq!(
+        known_failure.json::<Value>().await.unwrap()["result"]["isError"],
+        true
+    );
+}
+
 async fn rpc(
     client: &reqwest::Client,
     url: &str,
@@ -195,7 +474,7 @@ async fn batching_depends_on_protocol_version_and_preserves_identity() {
 }
 
 #[tokio::test]
-async fn modern_protocol_is_not_advertised_or_accepted() {
+async fn legacy_initialize_does_not_negotiate_modern_protocol() {
     let (_dir, url) = server().await;
     let client = reqwest::Client::new();
     let initialized = rpc(
@@ -208,16 +487,164 @@ async fn modern_protocol_is_not_advertised_or_accepted() {
     )
     .await;
     assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+}
+
+#[tokio::test]
+async fn modern_discovery_calls_validation_and_isolation() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    let meta = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}});
+    let request = |method: &str, params: Value| {
+        let mut params = params;
+        params["_meta"] = meta.clone();
+        json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})
+    };
+    for method in ["server/discover", "tools/list"] {
+        let response = client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", method)
+            .json(&request(method, json!({})))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["result"]["resultType"], "complete");
+        if method == "server/discover" {
+            assert_eq!(body["result"]["supportedVersions"][0], "2026-07-28");
+        } else {
+            assert!(!body["result"]["tools"].as_array().unwrap().is_empty());
+        }
+    }
+    let body = request(
+        "tools/call",
+        json!({"name":"save_draft","arguments":{"document":{"title":"Private"}}}),
+    );
     let response = client
         .post(&url)
         .bearer_auth("first")
         .header("mcp-protocol-version", "2026-07-28")
-        .header("mcp-method", "server/discover")
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}))
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "save_draft")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let saved: Value = response.json().await.unwrap();
+    let draft = tool_json(&saved["result"]);
+    let body = request(
+        "tools/call",
+        json!({"name":"get_draft","arguments":{"id":draft["id"]}}),
+    );
+    let response = client
+        .post(&url)
+        .bearer_auth("second")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "get_draft")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["result"]["isError"],
+        true
+    );
+    for name in [None, Some("wrong"), Some("=?base64?Z2V0X2RyYWZ0?=")] {
+        let mut req = client
+            .post(&url)
+            .bearer_auth("second")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .json(&body);
+        if let Some(name) = name {
+            req = req.header("mcp-name", name);
+        }
+        let response = req.send().await.unwrap();
+        if name == Some("=?base64?Z2V0X2RyYWZ0?=") {
+            assert_eq!(response.status(), 200);
+        } else {
+            assert_eq!(response.status(), 400);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                -32020
+            );
+        }
+    }
+    let unknown = request("unknown/method", json!({}));
+    let response = client
+        .post(&url)
+        .bearer_auth("first")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "unknown/method")
+        .json(&unknown)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        -32601
+    );
+    let body = request("tools/list", json!({}));
+    for (version, method, expected) in [
+        (None, Some("tools/list"), -32020),
+        (Some("2026-07-28"), None, -32020),
+        (Some("2026-07-28"), Some("ping"), -32020),
+        (Some("2027-01-01"), Some("tools/list"), -32020),
+    ] {
+        let mut req = client.post(&url).bearer_auth("first").json(&body);
+        if let Some(v) = version {
+            req = req.header("mcp-protocol-version", v);
+        }
+        if let Some(v) = method {
+            req = req.header("mcp-method", v);
+        }
+        let response = req.send().await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            expected
+        );
+    }
+    let mut missing = body.clone();
+    missing["params"]["_meta"]
+        .as_object_mut()
+        .unwrap()
+        .remove("io.modelcontextprotocol/clientCapabilities");
+    let response = client
+        .post(&url)
+        .bearer_auth("first")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/list")
+        .json(&missing)
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 400);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        -32602
+    );
+    let mut future = body.clone();
+    future["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2027-01-01");
+    let response = client
+        .post(&url)
+        .bearer_auth("first")
+        .header("mcp-protocol-version", "2027-01-01")
+        .header("mcp-method", "tools/list")
+        .json(&future)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        -32022
+    );
 }
 
 #[tokio::test]

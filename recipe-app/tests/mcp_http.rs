@@ -47,6 +47,89 @@ async fn server() -> (tempfile::TempDir, String) {
 }
 
 #[tokio::test]
+async fn modern_tool_call_arguments_must_be_objects_when_present() {
+    let (_dir, url) = server().await;
+    let client = reqwest::Client::new();
+    for name in ["get_guidelines", "save_draft"] {
+        for arguments in [
+            json!([]),
+            json!("invalid"),
+            json!(null),
+            json!(42),
+            json!(true),
+        ] {
+            let body = json!({"jsonrpc":"2.0","id":"call","method":"tools/call","params":{
+                "name":name, "arguments":arguments,
+                "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+            }});
+            let response = client
+                .post(&url)
+                .bearer_auth("first")
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "tools/call")
+                .header("mcp-name", name)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["id"], "call");
+            assert_eq!(body["error"]["code"], -32602);
+            assert!(body.get("result").is_none());
+        }
+    }
+    assert_eq!(
+        tool_json(
+            &tool(
+                &client,
+                &url,
+                "authorization",
+                "Bearer first",
+                "list_drafts",
+                json!({})
+            )
+            .await
+        ),
+        json!([])
+    );
+    for arguments in [None, Some(json!({}))] {
+        let mut params = json!({"name":"get_guidelines","_meta":{
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}
+        }});
+        if let Some(arguments) = arguments {
+            params["arguments"] = arguments;
+        }
+        let response: Value = client
+            .post(&url)
+            .bearer_auth("first")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "get_guidelines")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":params}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["resultType"], "complete");
+        assert_ne!(response["result"]["isError"], true);
+    }
+    let legacy = tool(
+        &client,
+        &url,
+        "authorization",
+        "Bearer first",
+        "get_guidelines",
+        json!([]),
+    )
+    .await;
+    assert_ne!(legacy["isError"], true);
+    assert!(legacy["content"].is_array());
+}
+
+#[tokio::test]
 async fn cache_hints_are_modern_only_and_only_on_cacheable_successes() {
     let (_dir, url) = server().await;
     let client = reqwest::Client::new();

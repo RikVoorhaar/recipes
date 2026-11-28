@@ -298,6 +298,18 @@ pub(crate) async fn post(
         }
         if message.get("id").is_some()
             && message["method"] == "tools/call"
+            && message["params"]
+                .get("arguments")
+                .is_some_and(|arguments| !arguments.is_object())
+        {
+            return Json(json!({
+                "jsonrpc":"2.0", "id":message["id"],
+                "error":{"code":-32602,"message":"Invalid params: arguments must be an object"}
+            }))
+            .into_response();
+        }
+        if message.get("id").is_some()
+            && message["method"] == "tools/call"
             && !mcp::known_tool(message["params"]["name"].as_str().unwrap_or(""))
         {
             return Json(json!({
